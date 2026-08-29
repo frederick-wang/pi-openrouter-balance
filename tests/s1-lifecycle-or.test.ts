@@ -235,3 +235,39 @@ test("store: append/load per fingerprint, hygiene skips poisoned rows", () => {
 	io.writeFile("/fake/pi-openrouter-balance-snapshots.jsonl", JSON.stringify({ t: 9, fingerprint: "fp1", balance: 1, api_key: "sk-or-v1-xyz" }) + "\n");
 	assert.equal(store.load("fp1").length, 0); // poisoned row skipped
 });
+
+test("loader contract: module exposes a default factory function (pi's loader requires it)", async () => {
+	const mod = await import("../extensions/openrouter-balance.ts");
+	assert.equal(typeof mod.default, "function");
+});
+
+test("lifecycle: rpc/print modes never auto-poll (hasUI true in rpc must not count)", async () => {
+	const { client, calls } = makeClient({ fetchSnapshot: async () => ({ status: "ok", snapshot: snap({}) }) });
+	const { pi } = install({ client });
+	const { ctx } = freshCtx("rpc", orModel);
+	await pi.emit("session_start", {}, ctx);
+	await pi.emit("agent_settled", {}, ctx);
+	await flush();
+	assert.equal(calls.fetch, 0);
+});
+
+test("lifecycle: fingerprint without user id disables persistence and burn", async () => {
+	let appended = 0;
+	const store = { append: () => { appended += 1; }, load: () => [] as never };
+	const { client } = makeClient({ fetchSnapshot: async () => ({ status: "ok", snapshot: snap({ key: { usage: 1, usageDaily: 0, usageWeekly: 0, usageMonthly: 0, freeTier: false } }) }) });
+	const { pi } = install({ client, store: store as never });
+	const { ctx, log } = freshCtx("tui", orModel);
+	await pi.emit("session_start", {}, ctx);
+	await flush();
+	assert.equal(appended, 0);
+	assert.equal(log.notifications.length, 0);
+});
+
+test("lifecycle: insufficient toast fires without a snapshot (after_provider_response 402)", async () => {
+	const { client } = makeClient({ fetchSnapshot: async () => ({ status: "error", code: "insufficient", message: "credit limit reached" }) });
+	const { pi } = install({ client });
+	const { ctx, log } = freshCtx("tui", orModel);
+	await pi.emit("session_start", {}, ctx);
+	await flush();
+	assert.match(log.status.at(-1)?.text ?? "", /no credits left/);
+});

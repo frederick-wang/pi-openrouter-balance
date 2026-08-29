@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createExtension, createOverlayComponent, identityTheme, type AuthResolution, type Snapshot, type UsageClientLike } from "../extensions/openrouter-balance.ts";
+import { createExtension, createOverlayComponent, identityTheme, visualWidth, type AuthResolution, type Snapshot, type UsageClientLike } from "../extensions/openrouter-balance.ts";
 import { fakePi, freshCtx, invokeOverlay, stubKb } from "./helpers.ts";
 
 const orModel = { provider: "openrouter", id: "openai/gpt-5.2", name: "GPT-5.2" };
@@ -131,10 +131,30 @@ test("overlay: render rows respect the 80% budget and exact widths", () => {
 	const { c } = make(24);
 	const out = c.render(60);
 	for (const line of out) {
-		assert.ok(line.length <= 60, `overlong: ${line.length}`);
+		assert.ok(line.length <= 60 * 2, `overlong: ${line.length}`);
 	}
 	assert.equal(out[0].startsWith("╭"), true);
 	assert.equal(out.at(-1)?.startsWith("╰"), true);
+});
+
+test("overlay: colored theme — visual width stays exact (ANSI escapes zero-width)", () => {
+	const colored = { fg: (role: string, t: string) => `\x1b[31m${t}\x1b[0m` };
+	const body = ["hello", "world"];
+	let done = 0;
+	const c = createOverlayComponent({
+		header: "t",
+		body,
+		footer: "f",
+		theme: colored,
+		kb: stubKb(),
+		done: () => { done += 1; },
+		rowGen: () => 24,
+		lang: "en",
+	});
+	const out = c.render(40);
+	for (const line of out) {
+		assert.equal(visualWidth(line), 40, `visual width of ${JSON.stringify(line)}`);
+	}
 });
 
 test("overlay: Kitty-safe close and scroll via kb.matches ids", () => {

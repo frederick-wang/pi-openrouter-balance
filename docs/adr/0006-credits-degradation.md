@@ -1,3 +1,3 @@
 # 0006 — /credits failure is a state, not an error
 
-Any 401/403 on `/credits` sets `balanceUnavailable`, hides the balance line, shows 「账户余额 —（密钥无账户读取权限）」, and keeps the key-scoped view working. It is retried only on `--refresh` or auth re-resolution, never on every poll, and never renders an error state.
+Any 401/403 on `/credits` sets `balanceUnavailable`, hides the balance line, shows 「账户余额 —（密钥无账户读取权限）」, and keeps the key-scoped view working. A client-side denial latch skips the credits call on subsequent polls (a warning records the degraded view); it clears on activation, `--refresh`, or auth re-resolution, so recovery never requires a restart. 402 on the credits path marks the snapshot `insufficient` (account out of credits) rather than degrading. Transient credits failures (429/5xx/network) never replace the last-good balance: the snapshot keeps the previous balance with a warning. None of these paths render an error state.

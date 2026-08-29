@@ -5,36 +5,34 @@
  *
  * Runs ONE read-only refresh against OpenRouter (GET /api/v1/key +
  * GET /api/v1/credits) with pi's own credential (user-authorized; never in
- * CI; no writes). Prints a redacted summary. Never prints the key.
+ * CI; no writes). The token is resolved through pi's own CLI into a local
+ * variable and never printed. The label is omitted from output (it can be
+ * a masked key fragment).
  */
 
-import { createUsageClient, resolveOpenRouterAuth, formatMoney } from "../extensions/openrouter-balance.ts";
+import { execFile } from "node:child_process";
+import { createUsageClient, formatMoney, resolveOpenRouterAuth, type AuthResolution } from "../extensions/openrouter-balance.ts";
 
-const ctx = {
-	modelRegistry: {
-		getProviderAuth: async () => {
-			// Real pi resolution at runtime; here we go through the same API the
-			// extension uses.
-			const mod = (await import("@earendil-works/pi-coding-agent")) as {
-				readStoredCredential?: (providerId: string) => { type?: string; access?: string } | undefined;
-			};
-			const cred = mod.readStoredCredential?.("openrouter");
-			if (cred?.type === "oauth" && typeof cred.access === "string") {
-				return { auth: { apiKey: cred.access } };
+function resolveToken(): Promise<string | undefined> {
+	return new Promise((resolve) => {
+		execFile("pi", ["auth", "print-bearer-token", "--provider", "openrouter"], (err, stdout) => {
+			if (!err && stdout && stdout.trim()) {
+				resolve(stdout.trim());
+				return;
 			}
-			const envKey = process.env["OPENROUTER_API_KEY"];
-			return envKey ? { auth: { apiKey: envKey } } : undefined;
-		},
-	},
-};
+			const envKey = process.env["OPENROUTER_API_KEY"]?.trim();
+			resolve(envKey || undefined);
+		});
+	});
+}
 
-const auth = await resolveOpenRouterAuth(ctx as never);
-if (auth.status !== "ok") {
-	console.log(`auth       : ${auth.status}${auth.status === "auth-error" ? ` — ${auth.message}` : ""}`);
-	console.log("hint       : run /login and pick OpenRouter, or set OPENROUTER_API_KEY");
+const token = await resolveToken();
+if (!token) {
+	console.log("auth       : missing (run /login and pick OpenRouter, or set OPENROUTER_API_KEY)");
 	process.exit(1);
 }
-console.log(`token      : length ${auth.token.length} (not printed)`);
+console.log(`token      : length ${token.length} (not printed)`);
+const auth: AuthResolution = { status: "ok", token };
 
 const client = createUsageClient({ fetchImpl: fetch });
 const result = await client.fetchSnapshot(auth.token, undefined);
@@ -48,7 +46,6 @@ if (result.status === "ok") {
 		console.log(`balance    : unavailable for this key (key-scoped view remains)`);
 	}
 	const k = s.key;
-	console.log(`key label  : ${k.label ?? "?"}`);
 	console.log(`free tier  : ${k.freeTier ? "free account" : "paid account"}`);
 	console.log(`credit cap : ${k.limit != null ? formatMoney(k.limit) : "unset (unlimited)"}${k.limitRemaining != null ? ` — remaining ${formatMoney(k.limitRemaining)}` : ""}${k.limitReset ? ` — resets ${k.limitReset}` : ""}`);
 	console.log(`usage      : all ${formatMoney(k.usage)} · today ${formatMoney(k.usageDaily)} · week ${formatMoney(k.usageWeekly)} · month ${formatMoney(k.usageMonthly)} (UTC)`);

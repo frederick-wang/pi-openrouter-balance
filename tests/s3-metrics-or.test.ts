@@ -131,20 +131,6 @@ test("renderFooter: stale marker and free-model suffix", () => {
 	assert.match(out, /·免费/);
 });
 
-test("renderFooter: state strings", () => {
-	assert.match(renderState("insufficient", "zh"), /额度用尽/);
-	assert.match(renderState("auth", "en"), /auth error/);
-	assert.match(renderState("rate-limit", "en"), /rate limited/);
-	assert.match(renderState("none", "en"), /n\/a/);
-});
-
-function renderState(state: string, lang: string): string {
-	const s = snap({});
-	if (state === "insufficient") return `${s.key ? "" : ""}额度用尽`;
-	if (state === "auth") return "auth error";
-	if (state === "rate-limit") return "rate limited";
-	return "n/a";
-}
 
 test("buildReportLines: full report content", () => {
 	const s = snap({

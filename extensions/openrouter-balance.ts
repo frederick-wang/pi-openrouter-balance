@@ -10,7 +10,7 @@
  * usage client → metrics & formatters → overlay → lifecycle → command.
  * Terms follow CONTEXT.md; decisions live in docs/adr/.
  */
-import { createHash, createHmac } from "node:crypto";
+import { createHmac } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
@@ -72,6 +72,7 @@ export interface Snapshot {
 	key: KeyStatus;
 	account?: AccountBalance;
 	balanceUnavailable?: boolean;
+	insufficient?: boolean;
 	burnRate?: BurnRate;
 	warnings: string[];
 }
@@ -306,8 +307,7 @@ export function createUsageClient(deps: {
 	const maxBodyBytes = deps.maxBodyBytes ?? MAX_BODY_BYTES;
 	const now = () => (deps.nowFn ?? Date.now)();
 	const userAgent = deps.userAgent ?? `pi (${nodeOs.platform()} ${nodeOs.release()}; ${nodeOs.arch()})`;
-	let consecutiveAuthFailures = 0;
-	let authLatch = false;
+	let creditsDenied = false;
 
 	async function getJson(url: string, token: string, signal: AbortSignal | undefined): Promise<{ status: number; ok: boolean; text: string; headers: Record<string, string> }> {
 		const timeoutSignal = AbortSignal.timeout(timeoutMs);
@@ -337,7 +337,6 @@ export function createUsageClient(deps: {
 
 	return {
 		async fetchSnapshot(token, signal) {
-			if (authLatch) return { status: "error", code: "auth", message: "credential rejected; paused" };
 			const warnings: string[] = [];
 
 			let keyResp: { status: number; ok: boolean; text: string; headers: Record<string, string> };
@@ -347,8 +346,6 @@ export function createUsageClient(deps: {
 				return { status: "error", code: error instanceof UsageError ? error.code : "transient", message: error instanceof Error ? error.message : String(error) };
 			}
 			if (keyResp.status === 401 || keyResp.status === 403) {
-				consecutiveAuthFailures += 1;
-				if (consecutiveAuthFailures >= 2) authLatch = true;
 				return { status: "error", code: "auth", message: "the credential was rejected by OpenRouter" };
 			}
 			if (keyResp.status === 402) return { status: "error", code: "insufficient", message: "credit limit reached" };
@@ -368,13 +365,17 @@ export function createUsageClient(deps: {
 
 			let account: AccountBalance | undefined;
 			let balanceUnavailable = false;
+			let insufficient = false;
 			try {
+				if (creditsDenied) {
+					warnings.push("credits endpoint denied; key-scoped view");
+				} else {
 				const creditsResp = await getJson(CREDITS_URL, token, signal);
 				if (creditsResp.status === 401 || creditsResp.status === 403) {
+					creditsDenied = true;
 					balanceUnavailable = true;
 				} else if (creditsResp.status === 402) {
-					balanceUnavailable = true;
-					warnings.push("credits endpoint reported 402");
+					insufficient = true;
 				} else if (creditsResp.status === 429) {
 					warnings.push("credits endpoint rate limited; balance not refreshed this cycle");
 				} else if (creditsResp.status >= 500 || !creditsResp.ok) {
@@ -387,12 +388,12 @@ export function createUsageClient(deps: {
 						warnings.push("credits endpoint returned an unexpected shape");
 					}
 				}
+				}
 			} catch (error) {
 				// Network/timeout on the balance path must not fail the snapshot.
 				warnings.push(`credits fetch degraded: ${error instanceof Error ? error.message : String(error)}`);
 			}
 
-			consecutiveAuthFailures = 0;
 			return {
 				status: "ok",
 				snapshot: {
@@ -402,13 +403,13 @@ export function createUsageClient(deps: {
 					key,
 					...(account ? { account } : {}),
 					...(balanceUnavailable ? { balanceUnavailable: true } : {}),
+					...(insufficient ? { insufficient: true } : {}),
 					warnings,
 				},
 			};
 		},
 		resetBreaker() {
-			consecutiveAuthFailures = 0;
-			authLatch = false;
+			creditsDenied = false;
 		},
 	};
 }
@@ -619,6 +620,10 @@ function limitResetLabel(cadence: string, lang: Lang): string {
 	return cadence; // unknown cadence passes through opaquely
 }
 
+export function cappedKey(k: Pick<KeyStatus, "limit" | "limitRemaining">): boolean {
+	return k.limitRemaining != null && k.limit != null && k.limit > 0;
+}
+
 export function renderBar(ratio: number, theme: FooterTheme): string {
 	const width = 8;
 	const filled = Math.round((clampPercent(ratio * 100) / 100) * width);
@@ -662,7 +667,7 @@ export function renderFooter(snapshot: Snapshot, opts: FooterOpts): string {
 	} else {
 		return `${label} ${theme.fg("dim", msg(lang, "nA"))}`;
 	}
-	const capped = snapshot.key.limitRemaining != null && snapshot.key.limit != null && snapshot.key.limit > 0;
+	const capped = cappedKey(snapshot.key);
 	let body = base;
 	if (capped) {
 		const ratio = snapshot.key.limitRemaining! / snapshot.key.limit!;
@@ -710,10 +715,12 @@ export function buildReportLines(snapshot: Snapshot, opts: ReportOpts): string[]
 		lines.push(`  ${msg(lang, "accountBalance")}: ${msg(lang, "balanceUnavailable")}`);
 	}
 	const k = snapshot.key;
-	if (k.limit != null) {
-		const ratio = k.limitRemaining != null && k.limit > 0 ? k.limitRemaining / k.limit : 0;
+	if (cappedKey(k)) {
+		const ratio = k.limitRemaining! / k.limit!;
 		const reset = k.limitReset ? limitResetLabel(k.limitReset, lang) : "—";
-		lines.push(`  ${msg(lang, "creditLimit")}: ${renderBar(ratio, identityTheme)} ${Math.round(clampPercent(ratio * 100))}% — ${msg(lang, "creditLimitDetail", { limit: formatMoney(k.limit), remaining: formatMoney(k.limitRemaining ?? 0), reset })}`);
+		lines.push(`  ${msg(lang, "creditLimit")}: ${renderBar(ratio, identityTheme)} ${Math.round(clampPercent(ratio * 100))}% — ${msg(lang, "creditLimitDetail", { limit: formatMoney(k.limit!), remaining: formatMoney(k.limitRemaining!), reset })}`);
+	} else if (k.limit != null) {
+		lines.push(`  ${msg(lang, "creditLimit")}: ${formatMoney(k.limit)} — ${msg(lang, "nA")}`);
 	} else {
 		lines.push(`  ${msg(lang, "creditLimit")}: ${msg(lang, "creditLimitUnset")}`);
 	}
@@ -1063,10 +1070,11 @@ export function createOverlayComponent(opts: OverlayComponentOpts): OverlayCompo
 		blocks.push("");
 		blocks.push(footerRow);
 		if (!boxed) {
-			const out: string[] = [titleRow];
-			if (win.lines.length > 0) out.push("", ...win.lines);
-			if (statusRow) out.push("", statusRow);
-			out.push(footerRow);
+			const pad = (line: string) => padToWidth(line, w);
+			const out: string[] = [pad(titleRow)];
+			if (win.lines.length > 0) out.push(pad(""), ...win.lines.map(pad));
+			if (statusRow) out.push(pad(""), pad(statusRow));
+			out.push(pad(footerRow));
 			return out;
 		}
 		const titleStr = clampChrome(` ${theme.fg("accent", header)} `, innerW);
@@ -1335,7 +1343,7 @@ export function createExtension(deps: ExtensionDeps) {
 	const clearTimeoutImpl = deps.clearTimeout ?? clearTimeout;
 	const setIntervalImpl = deps.setInterval ?? setInterval;
 	const clearIntervalImpl = deps.clearInterval ?? clearInterval;
-	const isInteractive = (ctx: CtxLike) => deps.interactive?.(ctx) ?? (ctx.mode === "tui" || ctx.hasUI === true);
+	const isInteractive = (ctx: CtxLike) => deps.interactive?.(ctx) ?? ctx.mode === "tui";
 	const lang = resolveLang(deps.env ?? {});
 	const store = deps.store ?? { append() { /* */ }, load: () => [] };
 	const warnThreshold = () => {
@@ -1386,6 +1394,7 @@ export function createExtension(deps: ExtensionDeps) {
 			if (!s.active) return "";
 			const label = "openrouter";
 			const theme = (s.lastCtx?.ui as UiLike | undefined)?.theme ?? identityTheme;
+			if (s.insufficient) return `${label} ${theme.fg("error", msg(lang, "insufficient"))}`;
 			if (s.authInvalid) return `${label} ${theme.fg("error", msg(lang, "authError"))}`;
 			if (!s.snapshot) {
 				if (now() < s.retryDeadline) return `${label} ${theme.fg("dim", msg(lang, "rateLimited"))}`;
@@ -1431,8 +1440,12 @@ export function createExtension(deps: ExtensionDeps) {
 		};
 
 		const scheduleRetryOneShot = (ctx: CtxLike) => {
-			if (retryOneShot) return;
 			const delay = Math.max(1_000, s.retryDeadline - now());
+			if (retryOneShot) {
+				// Re-arm with the (possibly extended) deadline.
+				clearTimeoutImpl(retryOneShot as never);
+				retryOneShot = null;
+			}
 			retryOneShot = setTimeoutImpl(() => {
 				retryOneShot = null;
 				if (s.active && isInteractive(ctx)) void refresh(ctx, false);
@@ -1442,9 +1455,15 @@ export function createExtension(deps: ExtensionDeps) {
 
 		function emitAlerts(ctx: CtxLike): void {
 			const ui = ctx.ui as UiLike | undefined;
-			if (!ui || !s.snapshot) return;
-			const balance = s.snapshot.account?.balance;
-			const limitRemaining = s.snapshot.key.limitRemaining ?? undefined;
+			if (!ui) return;
+			const snap = s.snapshot;
+			// Free accounts never purchased: balance 0/negative must not raise
+			// low-balance alerts (ADR-0005); insufficient still applies.
+			const balance =
+				snap?.account && !(snap.key.freeTier && snap.account.totalCredits === 0)
+					? snap.account.balance
+					: undefined;
+			const limitRemaining = snap?.key.limitRemaining ?? undefined;
 			const { emitted, state } = evaluateAlerts(s.alertState, {
 				...(balance !== undefined ? { balance } : {}),
 				...(limitRemaining !== undefined ? { limitRemaining } : {}),
@@ -1453,7 +1472,7 @@ export function createExtension(deps: ExtensionDeps) {
 			});
 			s.alertState = state;
 			for (const e of emitted) {
-				ui.notify(msg(lang, e.messageKey, e.vars), e.kind === "low-balance" && e.vars.threshold === formatMoney(errorThreshold()) ? "error" : e.kind === "insufficient" ? "error" : "warning");
+				ui.notify(msg(lang, e.messageKey, e.vars), e.kind === "insufficient" ? "error" : e.kind === "low-balance" && e.vars.threshold === formatMoney(errorThreshold()) ? "error" : "warning");
 			}
 		}
 
@@ -1478,10 +1497,15 @@ export function createExtension(deps: ExtensionDeps) {
 				const result = await deps.clientFor().fetchSnapshot(auth.token, ctxSignal(ctx));
 				if (gen !== s.generation) return;
 				if (result.status === "ok") {
+					if (s.insufficient && result.snapshot.insufficient !== true) {
+						// recovered: re-arm
+						void 0;
+					}
 					s.retryDeadline = 0;
 					s.authInvalid = false;
 					s.lastError = null;
-					s.insufficient = false;
+					s.insufficient = result.snapshot.insufficient === true;
+					deps.clientFor().resetBreaker();
 					const snap = result.snapshot;
 					// fingerprint switch: drop burn history and rebase
 					if (s.fingerprint !== null && s.fingerprint !== snap.fingerprint) {
@@ -1491,9 +1515,9 @@ export function createExtension(deps: ExtensionDeps) {
 					s.snapshot = snap;
 					s.stale = false;
 					s.lastOkFetchAt = now();
-					if (snap.account) store.append({ t: now(), fingerprint: snap.fingerprint, balance: snap.account.balance });
-					const series = s.fingerprint ? store.load(s.fingerprint) : [];
-					const rate = estimateBurnRate(series);
+					if (snap.key.userId && snap.account) store.append({ t: now(), fingerprint: snap.fingerprint, balance: snap.account.balance });
+					const series = snap.key.userId ? store.load(snap.fingerprint) : [];
+					const rate = snap.key.userId ? estimateBurnRate(series) : null;
 					s.snapshot = rate ? { ...snap, burnRate: rate } : snap;
 					emitAlerts(ctx);
 				} else if (result.status === "retry") {
@@ -1528,6 +1552,7 @@ export function createExtension(deps: ExtensionDeps) {
 						}
 						s.authInvalid = true;
 						s.lastError = "auth";
+						s.nextAllowedAt = now() + 60_000;
 						if (s.snapshot) s.stale = true;
 					} else if (result.code === "insufficient") {
 						s.insufficient = true;
@@ -1571,6 +1596,7 @@ export function createExtension(deps: ExtensionDeps) {
 			}
 			if (!isInteractive(ctx)) return;
 			s.active = true;
+			deps.clientFor().resetBreaker();
 			render();
 			startHeartbeat();
 			void refresh(ctx, true);
@@ -1592,6 +1618,10 @@ export function createExtension(deps: ExtensionDeps) {
 			if (!isInteractive(ctx) || !s.active) return;
 			scheduleDebouncedRefresh(ctx);
 		});
+		api.on("agent_end", async (_event, ctx) => {
+			if (!isInteractive(ctx) || !s.active) return;
+			scheduleDebouncedRefresh(ctx);
+		});
 		api.on("after_provider_response", async (event, ctx) => {
 			if (!isInteractive(ctx) || !s.active) return;
 			if (ctx.model?.provider !== PROVIDER_ID) return;
@@ -1605,6 +1635,7 @@ export function createExtension(deps: ExtensionDeps) {
 		});
 		api.on("session_shutdown", async () => {
 			s.generation += 1;
+			s.inFlight = false;
 			s.active = false;
 			clearTimers();
 			render();
@@ -1642,15 +1673,16 @@ export function createExtension(deps: ExtensionDeps) {
 						ui.notify(msg(lang, "rateLimitedNotify"), "error");
 						return;
 					}
+					if (parsed.refresh) deps.clientFor().resetBreaker();
 					const result = await deps.clientFor().fetchSnapshot(auth.token, ctxSignal(ctx));
 					if (result.status !== "ok") {
 						ui.notify(result.status === "retry" ? msg(lang, "rateLimitedNotify") : result.message || msg(lang, "fetchFailed"), "error");
 						return;
 					}
 					const snap = result.snapshot;
-					if (snap.account) store.append({ t: now(), fingerprint: snap.fingerprint, balance: snap.account.balance });
-					const series = store.load(snap.fingerprint);
-					const rate = estimateBurnRate(series);
+					if (snap.key.userId && snap.account) store.append({ t: now(), fingerprint: snap.fingerprint, balance: snap.account.balance });
+					const series = snap.key.userId ? store.load(snap.fingerprint) : [];
+					const rate = snap.key.userId ? estimateBurnRate(series) : null;
 					const finalSnap = rate ? { ...snap, burnRate: rate } : snap;
 					if (s.active && ctx.model?.provider === PROVIDER_ID) {
 						s.lastCtx = ctx;
@@ -1721,7 +1753,7 @@ function parseCommandArgs(args: string): { refresh: boolean; json: boolean; erro
 	return { refresh, json };
 }
 
-export function openRouterBalanceInstall(pi: unknown): void {
+export default function openRouterBalanceInstall(pi: unknown): void {
 	const env = process.env as Record<string, string | undefined>;
 	const homedir = nodeOs.homedir();
 	const dir = env["PI_CODING_AGENT_DIR"] ?? nodePath.join(homedir, ".pi", "agent");
