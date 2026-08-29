@@ -414,7 +414,370 @@ export function createUsageClient(deps: {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Extension placeholder (filled by tickets T02+)
+// Metrics: burn rate, runway, money formatting
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface BalanceSample {
+	t: number;
+	balance: number;
+}
+
+const BURN_MIN_COUNT = 3;
+const BURN_MIN_SPAN_MS = 3_600_000;
+const MONEY_EPSILON = 1e-9;
+
+/**
+ * Burn rate from the account balance series. Balance decreases with use;
+ * a top-up jumps it up and opens a new window. Walks back from the newest
+ * sample while the series stays non-increasing (epsilon for float jitter),
+ * requires ≥3 samples over ≥1h, and returns null without a positive drop.
+ */
+export function estimateBurnRate(snapshots: BalanceSample[]): BurnRate | null {
+	const usable = snapshots.filter((s) => Number.isFinite(s.t) && Number.isFinite(s.balance));
+	if (usable.length < BURN_MIN_COUNT) return null;
+	let start = usable.length - 1;
+	while (start > 0 && usable[start - 1].balance >= usable[start].balance - MONEY_EPSILON) start -= 1;
+	const window = usable.slice(start);
+	if (window.length < BURN_MIN_COUNT) return null;
+	const span = window[window.length - 1].t - window[0].t;
+	if (span < BURN_MIN_SPAN_MS) return null;
+	const drop = window[0].balance - window[window.length - 1].balance;
+	if (drop <= MONEY_EPSILON) return null;
+	return { perHour: (drop / span) * 3_600_000, windowHours: span / 3_600_000 };
+}
+
+export function runwayHours(balance: number, perHour: number): number | null {
+	if (perHour <= 0 || balance < 0 || !Number.isFinite(balance) || !Number.isFinite(perHour)) return null;
+	const hours = balance / perHour;
+	return Number.isFinite(hours) ? hours : null;
+}
+
+/** `$12.34` / `-$2.50` — money is a number, formatting is display-only. */
+export function formatMoney(amount: number): string {
+	if (!Number.isFinite(amount)) return "$";
+	return amount < 0 ? `-$${Math.abs(amount).toFixed(2)}` : `$${amount.toFixed(2)}`;
+}
+
+/** Compact money for footer bars: same rule, no padding concerns. */
+export function compactMoney(amount: number): string {
+	return formatMoney(amount);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// i18n
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type Lang = "en" | "zh";
+
+export function resolveLang(env: Record<string, string | undefined>): Lang {
+	const explicit = env["PI_OPENROUTER_BALANCE_LANG"];
+	if (explicit === "zh" || explicit === "en") return explicit;
+	const locale = new Intl.DateTimeFormat().resolvedOptions().locale;
+	return locale.toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+
+type MsgVars = Record<string, string | number>;
+
+const MESSAGES: Record<Lang, Record<string, (v: MsgVars) => string>> = {
+	en: {
+		reportTitle: () => "OpenRouter Balance & Usage",
+		visitPage: () => `More at ${USAGE_PAGE_URL}`,
+		pressClose: () => "Press Enter, Esc, or Ctrl+C to close · ↑↓ scroll",
+		pressCloseShort: () => "Esc to close",
+		scrollStatus: (v) => `${v.pos}/${v.total} lines · ↑↓ scroll · Enter closes`,
+		accountBalance: () => "Account balance",
+		balanceDetail: (v) => `purchased ${v.credits} − used ${v.usage}`,
+		balanceUnavailable: () => "Account balance — (key lacks account read permission)",
+		creditLimit: () => "Credit limit",
+		creditLimitUnset: () => "unset (unlimited)",
+		creditLimitDetail: (v) => `${v.limit} · ${v.remaining} remaining · resets ${v.reset}`,
+		keyLabel: () => "Key label",
+		paidAccount: () => "paid account (credits purchased)",
+		freeAccount: () => "free account (no purchases yet)",
+		today: () => "Today",
+		thisWeek: () => "This week",
+		thisMonth: () => "This month",
+		byok: () => "BYOK",
+		burnRate: (v) => `${v.rate}/h (${v.window})`,
+		runway: (v) => `≈ ${v.days}d remaining`,
+		freeModelStatus: (v) => `Current model: free model (${v.caps})`,
+		freeModelCaps: () => "20 req/min · 50 req/day",
+		modelPaidNote: () => "Current model: free model",
+		updatedAgo: (v) => `updated ${v.age}`,
+		source: (v) => `source: ${v.source}`,
+		staleMark: () => "stale",
+		nA: () => "n/a",
+		error: () => "error",
+		rateLimited: () => "rate limited",
+		authError: () => "auth error",
+		insufficient: () => "no credits left",
+		freeModelSuffix: () => "free",
+		authNeeded: () => "pi-openrouter-balance: no OpenRouter credential. Run /login and pick OpenRouter, or set OPENROUTER_API_KEY.",
+		authFailed: () => "pi-openrouter-balance: usage fetch failed (credential rejected).",
+		fetchFailed: () => "pi-openrouter-balance: usage fetch failed.",
+		rateLimitedNotify: () => "pi-openrouter-balance: OpenRouter is rate-limiting; retry shortly.",
+		jsonModeRestricted: () => "pi-openrouter-balance: --json requires TUI or print mode.",
+		unknownArgs: (v) => `Unknown option: ${v.arg}. Usage: /openrouter-balance [--json|--refresh]`,
+		alertLowBalance: (v) => `OpenRouter balance ${v.balance} is below ${v.threshold}.`,
+		alertLowLimit: (v) => `OpenRouter remaining limit ${v.remaining} is below ${v.threshold}.`,
+		alertInsufficient: () => "OpenRouter no credits left.",
+		alertRecovered: () => "",
+		reportSummary: (v) => `OpenRouter balance ${v.balance}`,
+		ageJustNow: () => "just now",
+		ageSec: (v) => `${v.n}s ago`,
+		ageMin: (v) => `${v.n}m ago`,
+		ageHour: (v) => `${v.n}h ago`,
+	},
+	zh: {
+		reportTitle: () => "OpenRouter 余额与用量",
+		visitPage: () => `更多信息见 ${USAGE_PAGE_URL}`,
+		pressClose: () => "按 Enter、Esc 或 Ctrl+C 关闭 · ↑↓ 滚动",
+		pressCloseShort: () => "Esc 关闭",
+		scrollStatus: (v) => `第 ${v.pos}/${v.total} 行 · ↑↓ 滚动 · Enter 关闭`,
+		accountBalance: () => "账户余额",
+		balanceDetail: (v) => `充值 ${v.credits} − 已用 ${v.usage}`,
+		balanceUnavailable: () => "账户余额 —（密钥无账户读取权限）",
+		creditLimit: () => "额度上限",
+		creditLimitUnset: () => "未设置（不限额）",
+		creditLimitDetail: (v) => `${v.limit} · 剩余 ${v.remaining} · ${v.reset}重置`,
+		keyLabel: () => "密钥标签",
+		paidAccount: () => "付费账户（已购买额度）",
+		freeAccount: () => "免费账户（从未购买额度）",
+		today: () => "今日",
+		thisWeek: () => "本周",
+		thisMonth: () => "本月",
+		byok: () => "自带密钥（BYOK）",
+		burnRate: (v) => `${v.rate}/小时（近 ${v.window}）`,
+		runway: (v) => `≈ 还可使用 ${v.days} 天`,
+		freeModelStatus: (v) => `当前模型：免费模型（${v.caps}）`,
+		freeModelCaps: () => "20 次/分 · 50 次/日",
+		modelPaidNote: () => "当前模型：免费模型",
+		updatedAgo: (v) => `更新于 ${v.age}`,
+		source: (v) => `来源：${v.source}`,
+		staleMark: () => "陈旧",
+		nA: () => "n/a",
+		error: () => "错误",
+		rateLimited: () => "限流中",
+		authError: () => "认证错误",
+		insufficient: () => "额度用尽",
+		freeModelSuffix: () => "免费",
+		authNeeded: () => "pi-openrouter-balance：没有找到 OpenRouter 凭据。请运行 /login 选择 OpenRouter，或设置 OPENROUTER_API_KEY。",
+		authFailed: () => "pi-openrouter-balance：用量获取失败（凭据被拒绝）。",
+		fetchFailed: () => "pi-openrouter-balance：用量获取失败。",
+		rateLimitedNotify: () => "pi-openrouter-balance：OpenRouter 限流中，稍后重试。",
+		jsonModeRestricted: () => "pi-openrouter-balance：--json 只支持 TUI 或 print 模式。",
+		unknownArgs: (v) => `未知选项：${v.arg}。用法：/openrouter-balance [--json|--refresh]`,
+		alertLowBalance: (v) => `OpenRouter 余额 ${v.balance} 已低于 ${v.threshold}。`,
+		alertLowLimit: (v) => `OpenRouter 剩余额度 ${v.remaining} 已低于 ${v.threshold}。`,
+		alertInsufficient: () => "OpenRouter 额度用尽。",
+		alertRecovered: () => "",
+		reportSummary: (v) => `OpenRouter 余额 ${v.balance}`,
+		ageJustNow: () => "刚刚",
+		ageSec: (v) => `${v.n} 秒前`,
+		ageMin: (v) => `${v.n} 分钟前`,
+		ageHour: (v) => `${v.n} 小时前`,
+	},
+};
+
+export type MsgKey = keyof typeof MESSAGES.en;
+
+/** Test hook: en/zh catalog parity (silent en fallback must never hide drift). */
+export function catalogKeyDiff(): { zhMissing: string[]; enMissing: string[]; orphanKeys: string[] } {
+	const enKeys = Object.keys(MESSAGES.en);
+	const zhKeys = Object.keys(MESSAGES.zh);
+	return {
+		zhMissing: enKeys.filter((k) => !(k in MESSAGES.zh)),
+		enMissing: zhKeys.filter((k) => !(k in MESSAGES.en)),
+		orphanKeys: zhKeys.filter((k) => !enKeys.includes(k)),
+	};
+}
+
+export function msg(lang: Lang, key: MsgKey, vars: MsgVars = {}): string {
+	const fn = MESSAGES[lang][key] ?? MESSAGES.en[key];
+	return fn ? fn(vars) : key;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Footer, report, JSON builders
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface FooterTheme {
+	fg(role: string, text: string): string;
+}
+
+export const identityTheme: FooterTheme = { fg: (_role, text) => text };
+
+const RESET_LABELS: Record<string, { en: string; zh: string }> = {
+	daily: { en: "daily", zh: "每日" },
+	weekly: { en: "weekly", zh: "每周" },
+	monthly: { en: "monthly", zh: "每月" },
+};
+
+function limitResetLabel(cadence: string, lang: Lang): string {
+	const label = RESET_LABELS[cadence.toLowerCase()];
+	if (label) return label[lang] ?? label.en;
+	return cadence; // unknown cadence passes through opaquely
+}
+
+export function renderBar(ratio: number, theme: FooterTheme): string {
+	const width = 8;
+	const filled = Math.round((clampPercent(ratio * 100) / 100) * width);
+	const role = remainingRatioHealth(ratio);
+	return theme.fg(role, "█".repeat(filled)) + theme.fg("dim", "░".repeat(width - filled));
+}
+
+export function remainingRatioHealth(ratio: number): string {
+	if (ratio >= 0.5) return "success";
+	if (ratio >= 0.2) return "warning";
+	return "error";
+}
+
+export interface FooterOpts {
+	now: number;
+	stale?: boolean;
+	freeModel?: boolean;
+	theme?: FooterTheme;
+	lang?: Lang;
+}
+
+const HOUR_MS = 3_600_000;
+const DAY_MS = 86_400_000;
+
+export function formatBurn(rate: BurnRate, lang: Lang): string {
+	const perHour = `${compactMoney(rate.perHour)}/h`;
+	const window = rate.windowHours >= 1 ? `${rate.windowHours.toFixed(1)}h` : `${Math.round(rate.windowHours * 60)}m`;
+	return lang === "zh" ? `${perHour}（近 ${window}）` : `${perHour} (${window})`;
+}
+
+export function renderFooter(snapshot: Snapshot, opts: FooterOpts): string {
+	const theme = opts.theme ?? identityTheme;
+	const lang = opts.lang ?? "en";
+	const label = "openrouter";
+	const rateText = snapshot.burnRate ? ` ↓${formatBurn(snapshot.burnRate, lang)}` : "";
+	let base = "";
+	if (snapshot.account) {
+		base = `${formatMoney(snapshot.account.balance)}`;
+	} else if (snapshot.balanceUnavailable) {
+		base = lang === "zh" ? `本月 ${formatMoney(snapshot.key.usageMonthly)}` : `This month ${formatMoney(snapshot.key.usageMonthly)}`;
+	} else {
+		return `${label} ${theme.fg("dim", msg(lang, "nA"))}`;
+	}
+	const capped = snapshot.key.limitRemaining != null && snapshot.key.limit != null && snapshot.key.limit > 0;
+	let body = base;
+	if (capped) {
+		const ratio = snapshot.key.limitRemaining! / snapshot.key.limit!;
+		body += ` ${renderBar(ratio, theme)} ${Math.round(clampPercent(ratio * 100))}% ${compactMoney(snapshot.key.limitRemaining!)}/${compactMoney(snapshot.key.limit!)}`;
+	}
+	let out = `${label} ${body}${rateText}`;
+	if (opts.stale) out = `${label} ~${body}${rateText}`;
+	if (opts.freeModel) out += lang === "zh" ? " ·免费" : " ·free";
+	return out;
+}
+
+function formatRunway(hours: number, lang: Lang): string {
+	if (hours >= 24) {
+		const days = hours / 24;
+		return lang === "zh" ? `≈ 还可使用 ${days.toFixed(1)} 天` : `≈ ${days.toFixed(1)}d remaining`;
+	}
+	return lang === "zh" ? `≈ 还可使用 ${hours.toFixed(1)} 小时` : `≈ ${hours.toFixed(1)}h remaining`;
+}
+
+function formatAge(ms: number, lang: Lang): string {
+	if (ms < 5_000) return msg(lang, "ageJustNow");
+	if (ms < 60_000) return msg(lang, "ageSec", { n: Math.round(ms / 1_000) });
+	if (ms < 3_600_000) return msg(lang, "ageMin", { n: Math.round(ms / 60_000) });
+	return msg(lang, "ageHour", { n: Math.round(ms / 3_600_000) });
+}
+
+export interface ReportOpts {
+	now: number;
+	lang: Lang;
+	stale?: boolean;
+	freeModel?: boolean;
+	runwayHours?: number | null;
+}
+
+export function buildReportLines(snapshot: Snapshot, opts: ReportOpts): string[] {
+	const lines: string[] = [];
+	const lang = opts.lang;
+	const age = formatAge(Math.max(0, opts.now - snapshot.capturedAt), lang);
+	lines.push(msg(lang, "updatedAgo", { age }) + (opts.stale ? ` (~)` : "") + ` · ${msg(lang, "source", { source: "API" })}`);
+	lines.push("");
+	if (snapshot.account) {
+		lines.push(`  ${msg(lang, "accountBalance")}: ${formatMoney(snapshot.account.balance)}`);
+		lines.push(`    ${msg(lang, "balanceDetail", { credits: formatMoney(snapshot.account.totalCredits), usage: formatMoney(snapshot.account.totalUsage) })}`);
+	} else if (snapshot.balanceUnavailable) {
+		lines.push(`  ${msg(lang, "accountBalance")}: ${msg(lang, "balanceUnavailable")}`);
+	}
+	const k = snapshot.key;
+	if (k.limit != null) {
+		const ratio = k.limitRemaining != null && k.limit > 0 ? k.limitRemaining / k.limit : 0;
+		const reset = k.limitReset ? limitResetLabel(k.limitReset, lang) : "—";
+		lines.push(`  ${msg(lang, "creditLimit")}: ${renderBar(ratio, identityTheme)} ${Math.round(clampPercent(ratio * 100))}% — ${msg(lang, "creditLimitDetail", { limit: formatMoney(k.limit), remaining: formatMoney(k.limitRemaining ?? 0), reset })}`);
+	} else {
+		lines.push(`  ${msg(lang, "creditLimit")}: ${msg(lang, "creditLimitUnset")}`);
+	}
+	const accountNote = k.freeTier ? msg(lang, "freeAccount") : msg(lang, "paidAccount");
+	lines.push(`  ${msg(lang, "keyLabel")}: ${k.label ?? "—"} · ${accountNote}`);
+	lines.push(`  ${msg(lang, "today")} ${formatMoney(k.usageDaily)} · ${msg(lang, "thisWeek")} ${formatMoney(k.usageWeekly)} · ${msg(lang, "thisMonth")} ${formatMoney(k.usageMonthly)} (UTC)`);
+	if (k.byokUsage && k.byokUsage > 0) {
+		lines.push(`  ${msg(lang, "byok")}: ${formatMoney(k.byokUsage)}`);
+	}
+	if (snapshot.burnRate) {
+		lines.push(`  ${lang === "zh" ? "消耗速率" : "Burn rate"}: ↓${formatBurn(snapshot.burnRate, lang)}`);
+	}
+	if (opts.runwayHours != null && opts.runwayHours > 0) {
+		lines.push(`  ${lang === "zh" ? "余额可用时长" : "Runway"}: ${formatRunway(opts.runwayHours, lang)}`);
+	}
+	if (opts.freeModel) {
+		const caps = k.freeTier ? msg(lang, "freeModelCaps") : "";
+		lines.push(`  ${lang === "zh" ? "模型状态" : "Model"}: ${caps ? msg(lang, "freeModelStatus", { caps }) : msg(lang, "modelPaidNote")}`);
+	}
+	if (snapshot.warnings.length > 0) {
+		lines.push("");
+		for (const w of snapshot.warnings) lines.push(`  · ${w}`);
+	}
+	lines.push("");
+	lines.push(msg(lang, "visitPage"));
+	return lines;
+}
+
+/** Stable English-key JSON payload; never credentials or fingerprints. */
+export function toJsonPayload(snapshot: Snapshot, opts: { stale?: boolean; runwayHours?: number | null }): unknown {
+	return {
+		schemaVersion: snapshot.schemaVersion,
+		capturedAt: snapshot.capturedAt,
+		freshness: opts.stale ? "stale" : "fresh",
+		...(snapshot.account
+			? { balance: { totalCredits: snapshot.account.totalCredits, totalUsage: snapshot.account.totalUsage, balance: snapshot.account.balance } }
+			: {}),
+		...(snapshot.balanceUnavailable ? { balanceUnavailable: true } : {}),
+		key: {
+			...(snapshot.key.label ? { label: snapshot.key.label } : {}),
+			...(snapshot.key.limit != null ? { limit: snapshot.key.limit } : {}),
+			...(snapshot.key.limitReset ? { limitReset: snapshot.key.limitReset } : {}),
+			...(snapshot.key.limitRemaining != null ? { limitRemaining: snapshot.key.limitRemaining } : {}),
+			...(snapshot.key.includeByokInLimit !== undefined ? { includeByokInLimit: snapshot.key.includeByokInLimit } : {}),
+			usage: snapshot.key.usage,
+			usageDaily: snapshot.key.usageDaily,
+			usageWeekly: snapshot.key.usageWeekly,
+			usageMonthly: snapshot.key.usageMonthly,
+			...(snapshot.key.byokUsage !== undefined ? { byokUsage: snapshot.key.byokUsage } : {}),
+			...(snapshot.key.byokUsageDaily !== undefined ? { byokUsageDaily: snapshot.key.byokUsageDaily } : {}),
+			...(snapshot.key.byokUsageWeekly !== undefined ? { byokUsageWeekly: snapshot.key.byokUsageWeekly } : {}),
+			...(snapshot.key.byokUsageMonthly !== undefined ? { byokUsageMonthly: snapshot.key.byokUsageMonthly } : {}),
+			freeTier: snapshot.key.freeTier,
+			...(snapshot.key.expiresAt ? { expiresAt: snapshot.key.expiresAt } : {}),
+		},
+		...(snapshot.burnRate ? { burnRate: { perHour: snapshot.burnRate.perHour, windowHours: snapshot.burnRate.windowHours } } : {}),
+		...(opts.runwayHours != null ? { runwayHours: opts.runwayHours } : {}),
+		warnings: snapshot.warnings,
+	};
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Extension placeholder (lifecycle lands in T03)
 // ─────────────────────────────────────────────────────────────────────────────
 export function openRouterBalanceInstall(_pi: unknown): void {
 	// Lifecycle lands in T03.
