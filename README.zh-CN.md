@@ -104,7 +104,7 @@ pi install git:github.com/frederick-wang/pi-openrouter-balance
 - `PI_OPENROUTER_BALANCE_LANG=zh|en` — 界面语言（默认：跟随系统语言，再英文）。
 - `PI_OPENROUTER_BALANCE_WARN` — 余额警告阈值（美元，默认 20）。
 - `PI_OPENROUTER_BALANCE_ERROR` — 余额错误阈值（美元，默认 5）。
-- `PI_OPENROUTER_BALANCE_RATE_MODE=account|key` — footer 显示哪种速率（默认 `account`；报告始终显示两套）。
+- `PI_OPENROUTER_BALANCE_RATE_MODE=key|account|both|hidden` — footer 显示哪种速率（默认 `key`；报告始终显示两套）。`/openrouter-balance rate-mode` 会把同一选择持久化到 `~/.pi/agent/pi-openrouter-balance-prefs.json`；环境变量优先，命令执行时会明说。
 - `PI_CODING_AGENT_DIR` — pi 配置目录（快照位置沿用 pi 自身约定）。
 
 ## 说明
