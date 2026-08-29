@@ -1,0 +1,3 @@
+# 0001 — Two read endpoints with the existing pi credential
+
+Balance and key status come from `GET /api/v1/key` and `GET /api/v1/credits`, both with pi's `openrouter` credential (env key or OAuth-derived key). Live verification (2026-08-29, user-approved probe): both return 200 with the OAuth-derived key — including `/credits`, whose docs require a management key. Docs-vs-behavior mismatch is recorded; the extension keeps a degradation path (`balanceUnavailable` + key-scoped view) in case the server starts enforcing the documented requirement. No management-key channels, no key CRUD, no writes.
