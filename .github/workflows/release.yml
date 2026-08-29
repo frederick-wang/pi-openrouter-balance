@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pnpm and Node.js
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          runtime: node@24
+          cache: true
+          install: false
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck
+      - run: pnpm test
+      - name: Verify tarball file list (gate)
+        run: node scripts/check-pack.mjs
+      # OIDC trusted publisher: frederick-wang/pi-openrouter-balance + release.yml.
+      # setup-node + registry-url is required; pnpm/setup alone yields ENEEDAUTH.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Assert version matches tag
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "package version: $VERSION / tag: $TAG"
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "::error::package.json version $VERSION does not match tag v$TAG"
+            exit 1
+          fi
+      # Publish via the npm OIDC Trusted Publisher configured for
+      # frederick-wang/pi-openrouter-balance + release.yml. (The first release
+      # v0.1.0 used the NPM_TOKEN secret path; that secret is removed and the
+      # workflow no longer sets NODE_AUTH_TOKEN. npm >= 11.5.1 supports OIDC
+      # trusted publishing; node:24 ships it.)
+      - name: Publish (npm OIDC trusted publishing)
+        run: |
+          echo "npm version: $(npm --version)"
+          npm publish --access public
