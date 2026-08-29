@@ -4,7 +4,10 @@ import {
 	catalogKeyDiff,
 	compactMoney,
 	estimateBurnRate,
+	estimateKeyBurnRate,
 	formatMoney,
+	fingerprintOf,
+	keyDiscriminator,
 	renderBar,
 	renderFooter,
 	runwayHours,
@@ -190,4 +193,61 @@ test("resolveLang and catalog parity", () => {
 	assert.equal(resolveLang({ PI_OPENROUTER_BALANCE_LANG: "en" }), "en");
 	const diff = catalogKeyDiff();
 	assert.deepEqual(diff, { zhMissing: [], enMissing: [], orphanKeys: [] });
+});
+
+test("estimateKeyBurnRate: per-key series, key switch starts a new segment, cent floor", () => {
+	const base = 10_000_000;
+	const series = [
+		{ t: 0, fingerprint: "acc", balance: 100, keyFp: "k1", keyUsage: 0.01 },
+		{ t: 3_600_000, fingerprint: "acc", balance: 99.9, keyFp: "k1", keyUsage: 0.02 },
+		{ t: 7_200_000, fingerprint: "acc", balance: 99.8, keyFp: "k1", keyUsage: 0.03 },
+	];
+	const rate = estimateKeyBurnRate(series as never);
+	assert.ok(rate);
+	assert.ok(Math.abs(rate.perHour - 0.01) < 1e-6, `perHour ${rate?.perHour}`);
+
+	// key switch (different keyFp) → old series ignored; new segment starts
+	const switched = [
+		...series,
+		{ t: 10_800_000, fingerprint: "acc", balance: 99.7, keyFp: "k1", keyUsage: 0.04 },
+		{ t: 14_400_000, fingerprint: "acc", balance: 99.6, keyFp: "k2", keyUsage: 0.5 },
+		{ t: 18_000_000, fingerprint: "acc", balance: 99.5, keyFp: "k2", keyUsage: 0.6 },
+		{ t: 21_600_000, fingerprint: "acc", balance: 99.4, keyFp: "k2", keyUsage: 0.7 },
+	];
+	const switchedRate = estimateKeyBurnRate(switched as never);
+	assert.ok(switchedRate);
+	assert.ok(Math.abs(switchedRate.perHour - 0.1) < 1e-6, `switched perHour ${switchedRate?.perHour}`); // 0.2 over 2h on k2
+
+	// cent floor: rise < 0.01 → null
+	const flat = [
+		{ t: 0, fingerprint: "acc", balance: 100, keyFp: "k1", keyUsage: 0.01 },
+		{ t: 3_600_000, fingerprint: "acc", balance: 99.9, keyFp: "k1", keyUsage: 0.01 },
+		{ t: 7_200_000, fingerprint: "acc", balance: 99.8, keyFp: "k1", keyUsage: 0.011 },
+	];
+	assert.equal(estimateKeyBurnRate(flat as never), null);
+});
+
+test("keyDiscriminator: stable per label, distinct per label, non-secret", () => {
+	assert.equal(keyDiscriminator("my-key"), keyDiscriminator("my-key"));
+	assert.notEqual(keyDiscriminator("my-key"), keyDiscriminator("other-key"));
+	assert.notEqual(keyDiscriminator("my-key"), fingerprintOf("user_x"));
+});
+
+test("renderFooter: burnMode=key uses the key burn rate", () => {
+	const s = snap({
+		key: key({ limit: null }),
+		account: acct(),
+		burnRate: { perHour: 0.42, windowHours: 5 },
+		keyBurnRate: { perHour: 0.01, windowHours: 5 },
+	});
+	const out = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "en", burnMode: "key" });
+	assert.match(out, /\$60\.00/);
+	assert.match(out, /0\.01\/h/);
+	assert.doesNotMatch(out, /0\.42\/h/);
+});
+
+test("toJsonPayload: keyBurnRate present when computed", () => {
+	const s = snap({ key: key({}), account: acct(), burnRate: { perHour: 0.42, windowHours: 5 }, keyBurnRate: { perHour: 0.01, windowHours: 5 } });
+	const p = JSON.parse(JSON.stringify(toJsonPayload(s, {}))) as Record<string, unknown>;
+	assert.equal((p.keyBurnRate as Record<string, number>).perHour, 0.01);
 });

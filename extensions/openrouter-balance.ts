@@ -74,6 +74,7 @@ export interface Snapshot {
 	balanceUnavailable?: boolean;
 	insufficient?: boolean;
 	burnRate?: BurnRate;
+	keyBurnRate?: BurnRate;
 	warnings: string[];
 }
 
@@ -447,6 +448,36 @@ export function estimateBurnRate(snapshots: BalanceSample[]): BurnRate | null {
 	return { perHour: (drop / span) * 3_600_000, windowHours: span / 3_600_000 };
 }
 
+/** Per-key series discriminator: HMAC(label) — stable, non-secret, distinct from account fingerprints. */
+export function keyDiscriminator(label: string | undefined): string {
+	return fingerprintOf(undefined, label ? `key:${label}` : "");
+}
+
+/**
+ * Burn rate from a per-key usage series. Usage is monotonic per key, but
+ * key switches and accounting resets can decrease it: any drop starts a new
+ * segment (same walkback shape as the balance top-ups). Same gates as the
+ * balance estimator PLUS a minimum absolute delta (cents quantization).
+ */
+export function estimateKeyBurnRate(snapshots: StoreBalanceRow[]): BurnRate | null {
+	const usable = snapshots.filter((sx) => Number.isFinite(sx.t) && Number.isFinite(sx.keyUsage ?? NaN));
+	if (usable.length < BURN_MIN_COUNT) return null;
+	// Segment on the LAST key discriminator; drops inside a segment restart it.
+	let start = usable.length - 1;
+	while (
+		start > 0 &&
+		usable[start - 1].keyFp === usable[usable.length - 1].keyFp &&
+		usable[start - 1].keyUsage! <= usable[start].keyUsage! + MONEY_EPSILON
+	) start -= 1;
+	const window = usable.slice(start);
+	if (window.length < BURN_MIN_COUNT) return null;
+	const span = window[window.length - 1].t - window[0].t;
+	if (span < BURN_MIN_SPAN_MS) return null;
+	const rise = window[window.length - 1].keyUsage! - window[0].keyUsage!;
+	if (rise < 0.01) return null; // cent quantization floor
+	return { perHour: (rise / span) * 3_600_000, windowHours: span / 3_600_000 };
+}
+
 export function runwayHours(balance: number, perHour: number): number | null {
 	if (perHour <= 0 || balance < 0 || !Number.isFinite(balance) || !Number.isFinite(perHour)) return null;
 	const hours = balance / perHour;
@@ -643,6 +674,7 @@ export interface FooterOpts {
 	freeModel?: boolean;
 	theme?: FooterTheme;
 	lang?: Lang;
+	burnMode?: "account" | "key";
 }
 
 const HOUR_MS = 3_600_000;
@@ -658,7 +690,9 @@ export function renderFooter(snapshot: Snapshot, opts: FooterOpts): string {
 	const theme = opts.theme ?? identityTheme;
 	const lang = opts.lang ?? "en";
 	const label = "openrouter";
-	const rateText = snapshot.burnRate ? ` ↓${formatBurn(snapshot.burnRate, lang)}` : "";
+	const burnMode = (opts.burnMode ?? "account");
+	const burn = burnMode === "key" ? (snapshot.keyBurnRate ?? snapshot.burnRate) : (snapshot.burnRate ?? snapshot.keyBurnRate);
+	const rateText = burn ? ` ↓${formatBurn(burn, lang)}` : "";
 	let base = "";
 	if (snapshot.account) {
 		base = `${formatMoney(snapshot.account.balance)}`;
@@ -731,7 +765,10 @@ export function buildReportLines(snapshot: Snapshot, opts: ReportOpts): string[]
 		lines.push(`  ${msg(lang, "byok")}: ${formatMoney(k.byokUsage)}`);
 	}
 	if (snapshot.burnRate) {
-		lines.push(`  ${lang === "zh" ? "消耗速率" : "Burn rate"}: ↓${formatBurn(snapshot.burnRate, lang)}`);
+		lines.push(`  ${lang === "zh" ? "账户消耗速率" : "Account burn rate"}: ↓${formatBurn(snapshot.burnRate, lang)}${lang === "zh" ? "（含全部密钥与网页端）" : " (all keys + web)"}`);
+	}
+	if (snapshot.keyBurnRate) {
+		lines.push(`  ${lang === "zh" ? "密钥消耗速率" : "Key burn rate"}: ↓${formatBurn(snapshot.keyBurnRate, lang)}${lang === "zh" ? "（该密钥所有调用者）" : " (all callers of this key)"}`);
 	}
 	if (opts.runwayHours != null && opts.runwayHours > 0) {
 		lines.push(`  ${lang === "zh" ? "余额可用时长" : "Runway"}: ${formatRunway(opts.runwayHours, lang)}`);
@@ -777,6 +814,7 @@ export function toJsonPayload(snapshot: Snapshot, opts: { stale?: boolean; runwa
 			...(snapshot.key.expiresAt ? { expiresAt: snapshot.key.expiresAt } : {}),
 		},
 		...(snapshot.burnRate ? { burnRate: { perHour: snapshot.burnRate.perHour, windowHours: snapshot.burnRate.windowHours } } : {}),
+		...(snapshot.keyBurnRate ? { keyBurnRate: { perHour: snapshot.keyBurnRate.perHour, windowHours: snapshot.keyBurnRate.windowHours } } : {}),
 		...(opts.runwayHours != null ? { runwayHours: opts.runwayHours } : {}),
 		warnings: snapshot.warnings,
 	};
@@ -1135,6 +1173,8 @@ export interface StoreBalanceRow {
 	t: number;
 	fingerprint: string;
 	balance: number;
+	keyFp?: string;
+	keyUsage?: number;
 }
 
 export interface BalanceStoreLike {
@@ -1175,7 +1215,13 @@ export function createBalanceStore(dir: string, io: StoreIo): BalanceStoreLike {
 				if (!isRecord(r)) continue;
 				if (typeof r["t"] !== "number" || typeof r["fingerprint"] !== "string" || typeof r["balance"] !== "number") continue;
 				if (!rowHygienic(r)) continue;
-				out.push({ t: r["t"], fingerprint: r["fingerprint"], balance: r["balance"] });
+				out.push({
+					t: r["t"],
+					fingerprint: r["fingerprint"],
+					balance: r["balance"],
+					...(typeof r["keyFp"] === "string" ? { keyFp: r["keyFp"] } : {}),
+					...(typeof r["keyUsage"] === "number" ? { keyUsage: r["keyUsage"] } : {}),
+				});
 			} catch {
 				// skip corrupt lines
 			}
@@ -1408,6 +1454,7 @@ export function createExtension(deps: ExtensionDeps) {
 				freeModel: s.lastCtx?.model?.id?.toLowerCase().endsWith(":free") === true,
 				theme,
 				lang,
+				burnMode: (deps.env?.["PI_OPENROUTER_BALANCE_BURN"] === "key" ? "key" : "account"),
 			});
 			return s.insufficient ? `${label} ${theme.fg("error", msg(lang, "insufficient"))}` : out;
 		}
@@ -1680,10 +1727,12 @@ export function createExtension(deps: ExtensionDeps) {
 						return;
 					}
 					const snap = result.snapshot;
-					if (snap.key.userId && snap.account) store.append({ t: now(), fingerprint: snap.fingerprint, balance: snap.account.balance });
+					const keyFp = snap.key.label ? keyDiscriminator(snap.key.label) : undefined;
+					if (snap.key.userId && snap.account) store.append({ t: now(), fingerprint: snap.fingerprint, balance: snap.account.balance, ...(keyFp ? { keyFp } : {}), ...(snap.key.usage > 0 ? { keyUsage: snap.key.usage } : {}) });
 					const series = snap.key.userId ? store.load(snap.fingerprint) : [];
 					const rate = snap.key.userId ? estimateBurnRate(series) : null;
-					const finalSnap = rate ? { ...snap, burnRate: rate } : snap;
+					const keyRate = snap.key.userId && keyFp ? estimateKeyBurnRate(series) : null;
+					const finalSnap = rate || keyRate ? { ...snap, ...(rate ? { burnRate: rate } : {}), ...(keyRate ? { keyBurnRate: keyRate } : {}) } : snap;
 					if (s.active && ctx.model?.provider === PROVIDER_ID) {
 						s.lastCtx = ctx;
 						s.snapshot = finalSnap;
