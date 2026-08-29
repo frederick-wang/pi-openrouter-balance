@@ -12,10 +12,6 @@ openrouter $149.70 ↓$0.42/h
 openrouter $60.00 ███████░ 68% $6.80/$20 ↓$0.42/h   ← per-key limit set
 ```
 
-## What it shows
-
-While an `openrouter` model is active: account balance (purchased − used), a per-key credit limit bar (remaining/limit; no bar when the key is unlimited — nothing is invented), period spends (today/week/month, UTC-labelled), BYOK split when nonzero, free-account vs paid-account status, free-model note when the active model id ends with `:free`, burn rate estimated from balance history, and a runway estimate when both exist. Alerts: balance below $20/$5 (env-overridable), same thresholds for a capped key's remaining limit, and an unconditional toast when OpenRouter answers 402.
-
 ## Install
 
 ```bash
@@ -30,11 +26,71 @@ pi install git:github.com/frederick-wang/pi-openrouter-balance
 
 Requires an OpenRouter login in pi (`/login` and pick OpenRouter, or `OPENROUTER_API_KEY`).
 
-## Commands
+## Usage
 
-- `/openrouter-balance` — full report overlay (all sections listed above).
-- `/openrouter-balance --json` — stable machine-readable snapshot (English keys only; no credentials or fingerprints). TUI shows it in the overlay; `print` mode writes it to stdout; other modes refuse.
-- `/openrouter-balance --refresh` — bypass the throttle and fetch immediately.
+### Footer
+
+Appears when the active model's provider is `openrouter`. Cleared on any other provider.
+
+| Element | Meaning |
+| --- | --- |
+| `$149.70` | account balance: purchased credits − used credits (may be negative; a negative balance is 402 risk) |
+| `$60.00` | same, when the key has a per-key credit limit and the bar takes over the middle of the line |
+| `███████░` | 8-cell remaining bar, shown **only when the key has a credit limit** (remaining/limit); no limit → no bar, nothing is invented |
+| `68%` | remaining percent of the per-key limit |
+| `$6.80/$20` | remaining amount / limit amount for that key |
+| `↓$0.42/h` | burn rate: credits/hour estimated from the balance history (needs ≥3 samples spanning ≥1 h, top-ups start a new window) |
+| `~` | prefix: last refresh failed, previous numbers kept (marked stale, never presented as current) |
+| `·免费` / `·free` | the active model id ends with `:free` (free-model status comes from the model, not the key) |
+| color | bar: green ≥ 50% remaining, yellow 20–49%, red < 20% |
+
+State strings replace the whole line when applicable:
+
+| State | Meaning |
+| --- | --- |
+| `n/a` | loading or no data yet |
+| `认证错误` / `auth error` | the credential was rejected (re-resolved once first) |
+| `限流中` / `rate limited` | OpenRouter answered 429; a retry is scheduled |
+| `额度用尽` / `no credits left` | a 402 came from a real request (or the credits endpoint); polling continues |
+
+### Alerts
+
+One toast per transition:
+
+| Trigger | Copy (EN) |
+| --- | --- |
+| balance ≤ `PI_OPENROUTER_BALANCE_WARN` (default $20) | `OpenRouter balance $18.20 is below $20.` |
+| balance ≤ `PI_OPENROUTER_BALANCE_ERROR` (default $5) | `OpenRouter balance $4.10 is below $5.` |
+| same thresholds against the key's remaining limit, when capped | `OpenRouter remaining limit $6.80 is below $20.` |
+| 402 from any request (or the credits endpoint) | `OpenRouter no credits left.` |
+
+Recovery re-arms the thresholds (a rise above the previous value, epsilon-tolerant); nothing is ever called a top-up. Free accounts (never purchased) get no low-balance alerts — the thresholds exist to protect a wallet, and a zero wallet is expected there. 402 stays unconditional.
+
+### `/openrouter-balance`
+
+Report overlay, all sections:
+
+| Section | Meaning |
+| --- | --- |
+| 账户余额 / Account balance | purchased − used for the account; the detail line shows both numbers |
+| 额度上限 / Credit limit | per-key cap: remaining bar + percent + remaining/limit + reset cadence (`daily`/`weekly`/`monthly`, opaque if new); `未设置（不限额）` when unlimited; never a invented 0% bar |
+| 密钥标签 / Key label | the server's key label (its own masked form) plus 付费账户（已购买额度）/ 免费账户（从未购买额度） |
+| 今日/本周/本月 (UTC) | period spends, server-computed; week starts Monday; UTC is labelled because “today” flips at 08:00 Beijing |
+| 自带密钥（BYOK） | spend from your own upstream keys; shown only when nonzero |
+| 消耗速率 / Burn rate | credits/hour + the sampling window |
+| 余额可用时长 / Runway | balance ÷ rate; shown only when both exist |
+| 模型状态 / Model | only when the active model id ends with `:free`: free-model caps (20 req/min · 50 req/day) are stated only for free accounts; paid accounts get the status without cap numbers |
+| 数据行 | freshness age + source; `(~)` marks stale |
+
+`/openrouter-balance --json` prints a stable schema (English keys; no credentials, no fingerprints) — TUI overlay or print mode stdout; RPC refuses.
+
+`/openrouter-balance --refresh` bypasses the throttle.
+
+The command works while another provider is selected; it does not turn the footer on.
+
+### Refresh
+
+Fetches on activation and on `/openrouter-balance`; after each settled turn at most every 60 s; a 5-minute heartbeat while an openrouter model is active; 429 honors `Retry-After` with one scheduled retry; 401/403 re-resolves the credential once. If `/credits` is denied (the server may enforce the documented management-key rule later), the extension degrades to key-scoped data with one explanatory line — transient failures keep the last-good balance.
 
 ## Auth & privacy
 
@@ -52,6 +108,6 @@ Requires an OpenRouter login in pi (`/login` and pick OpenRouter, or `OPENROUTER
 
 ## Notes
 
-- If OpenRouter ever stops allowing `/credits` for non-management keys, the extension degrades to key-scoped data with a single explanatory line — never a broken experience.
 - Burn rate needs at least three balance samples over an hour; it appears once it can be computed honestly.
 - Bars are drawn only for a per-key limit; with no limit the footer shows numbers, not an invented ratio.
+- Key `usage` counters are per-key (a fresh key reports 0 while the account keeps spending) — they are displayed, never used for rates.
