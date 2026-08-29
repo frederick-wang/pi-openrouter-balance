@@ -4,7 +4,10 @@ import {
 	catalogKeyDiff,
 	compactMoney,
 	estimateBurnRate,
+	estimateKeyBurnRate,
 	formatMoney,
+	fingerprintOf,
+	keyDiscriminator,
 	renderBar,
 	renderFooter,
 	runwayHours,
@@ -96,26 +99,54 @@ test("renderBar: 8 cells, colors by remaining ratio", () => {
 	assert.equal(remainingRatioHealth(0.1), "error");
 });
 
-test("renderFooter: capped + balance → balance, bar, ratio, rate", () => {
+test("renderFooter: capped + balance → balance, bar, ratio, rate (default = this key)", () => {
 	const s = snap({
 		key: key({ limit: 20, limitRemaining: 6.8, limitReset: "monthly" }),
 		account: acct(),
 		burnRate: { perHour: 0.42, windowHours: 5 },
+		keyBurnRate: { perHour: 0.01, windowHours: 5 },
 	});
 	const out = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "en" });
 	assert.match(out, /^openrouter /);
 	assert.match(out, /\$60\.00/);
 	assert.match(out, /34%/); // 6.8/20 remaining
-	assert.match(out, /\$6\.80\/\$20/);
-	assert.match(out, /↓\$0\.42\/h/);
+	assert.match(out, /\$6\.80\/\$20\.00/);
+	assert.match(out, /0\.01\/h/); // default shows THIS KEY rate
+	assert.match(out, /\(this key\)/);
 });
 
-test("renderFooter: uncapped + balance → no bar", () => {
+test("renderFooter: rateMode=account shows the account rate", () => {
+	const s = snap({
+		key: key({ limit: 20, limitRemaining: 6.8 }),
+		account: acct(),
+		burnRate: { perHour: 0.42, windowHours: 5 },
+		keyBurnRate: { perHour: 0.01, windowHours: 5 },
+	});
+	const out = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "zh", rateMode: "account" });
+	assert.match(out, /账户消耗速率 ↓\$0\.42\/h/);
+});
+
+test("renderFooter: rateMode=both and hidden", () => {
+	const s = snap({
+		key: key({}),
+		account: acct(),
+		burnRate: { perHour: 0.42, windowHours: 5 },
+		keyBurnRate: { perHour: 0.01, windowHours: 5 },
+	});
+	const both = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "zh", rateMode: "both" });
+	assert.match(both, /当前密钥消耗速率 ↓\$0\.01\/h/);
+	assert.match(both, /账户消耗速率 ↓\$0\.42\/h/);
+	const hidden = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "en", rateMode: "hidden" });
+	assert.equal(hidden.includes("\/h"), false);
+});
+
+test("renderFooter: uncapped + balance → no bar; account mode shows account rate", () => {
 	const s = snap({ key: key({ limit: null, limitRemaining: null }), account: acct(), burnRate: { perHour: 0.42, windowHours: 5 } });
-	const out = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "en" });
+	const out = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "en", rateMode: "account" });
 	assert.match(out, /^openrouter \$60\.00/);
 	assert.equal(out.includes("█"), false);
-	assert.match(out, /↓\$0\.42\/h/);
+	assert.match(out, /0\.42\/h/);
+	assert.match(out, /\(account\)/);
 });
 
 test("renderFooter: uncapped + balance unavailable → period spend focus", () => {
@@ -190,4 +221,61 @@ test("resolveLang and catalog parity", () => {
 	assert.equal(resolveLang({ PI_OPENROUTER_BALANCE_LANG: "en" }), "en");
 	const diff = catalogKeyDiff();
 	assert.deepEqual(diff, { zhMissing: [], enMissing: [], orphanKeys: [] });
+});
+
+test("estimateKeyBurnRate: per-key series, key switch starts a new segment, cent floor", () => {
+	const base = 10_000_000;
+	const series = [
+		{ t: 0, fingerprint: "acc", balance: 100, keyFp: "k1", keyUsage: 0.01 },
+		{ t: 3_600_000, fingerprint: "acc", balance: 99.9, keyFp: "k1", keyUsage: 0.02 },
+		{ t: 7_200_000, fingerprint: "acc", balance: 99.8, keyFp: "k1", keyUsage: 0.03 },
+	];
+	const rate = estimateKeyBurnRate(series as never);
+	assert.ok(rate);
+	assert.ok(Math.abs(rate.perHour - 0.01) < 1e-6, `perHour ${rate?.perHour}`);
+
+	// key switch (different keyFp) → old series ignored; new segment starts
+	const switched = [
+		...series,
+		{ t: 10_800_000, fingerprint: "acc", balance: 99.7, keyFp: "k1", keyUsage: 0.04 },
+		{ t: 14_400_000, fingerprint: "acc", balance: 99.6, keyFp: "k2", keyUsage: 0.5 },
+		{ t: 18_000_000, fingerprint: "acc", balance: 99.5, keyFp: "k2", keyUsage: 0.6 },
+		{ t: 21_600_000, fingerprint: "acc", balance: 99.4, keyFp: "k2", keyUsage: 0.7 },
+	];
+	const switchedRate = estimateKeyBurnRate(switched as never);
+	assert.ok(switchedRate);
+	assert.ok(Math.abs(switchedRate.perHour - 0.1) < 1e-6, `switched perHour ${switchedRate?.perHour}`); // 0.2 over 2h on k2
+
+	// cent floor: rise < 0.01 → null
+	const flat = [
+		{ t: 0, fingerprint: "acc", balance: 100, keyFp: "k1", keyUsage: 0.01 },
+		{ t: 3_600_000, fingerprint: "acc", balance: 99.9, keyFp: "k1", keyUsage: 0.01 },
+		{ t: 7_200_000, fingerprint: "acc", balance: 99.8, keyFp: "k1", keyUsage: 0.011 },
+	];
+	assert.equal(estimateKeyBurnRate(flat as never), null);
+});
+
+test("keyDiscriminator: stable per label, distinct per label, non-secret", () => {
+	assert.equal(keyDiscriminator("my-key"), keyDiscriminator("my-key"));
+	assert.notEqual(keyDiscriminator("my-key"), keyDiscriminator("other-key"));
+	assert.notEqual(keyDiscriminator("my-key"), fingerprintOf("user_x"));
+});
+
+test("renderFooter: rateMode=key uses the key burn rate", () => {
+	const s = snap({
+		key: key({ limit: null }),
+		account: acct(),
+		burnRate: { perHour: 0.42, windowHours: 5 },
+		keyBurnRate: { perHour: 0.01, windowHours: 5 },
+	});
+	const out = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "en", rateMode: "key" });
+	assert.match(out, /\$60\.00/);
+	assert.match(out, /0\.01\/h/);
+	assert.doesNotMatch(out, /0\.42\/h/);
+});
+
+test("toJsonPayload: keyBurnRate present when computed", () => {
+	const s = snap({ key: key({}), account: acct(), burnRate: { perHour: 0.42, windowHours: 5 }, keyBurnRate: { perHour: 0.01, windowHours: 5 } });
+	const p = JSON.parse(JSON.stringify(toJsonPayload(s, {}))) as Record<string, unknown>;
+	assert.equal((p.keyBurnRate as Record<string, number>).perHour, 0.01);
 });

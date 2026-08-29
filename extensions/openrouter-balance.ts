@@ -74,6 +74,7 @@ export interface Snapshot {
 	balanceUnavailable?: boolean;
 	insufficient?: boolean;
 	burnRate?: BurnRate;
+	keyBurnRate?: BurnRate;
 	warnings: string[];
 }
 
@@ -433,8 +434,8 @@ const MONEY_EPSILON = 1e-9;
  * sample while the series stays non-increasing (epsilon for float jitter),
  * requires ≥3 samples over ≥1h, and returns null without a positive drop.
  */
-export function estimateBurnRate(snapshots: BalanceSample[]): BurnRate | null {
-	const usable = snapshots.filter((s) => Number.isFinite(s.t) && Number.isFinite(s.balance));
+export function estimateBurnRate(snapshots: readonly { t: number; balance?: number }[]): BurnRate | null {
+	const usable = snapshots.filter((s): s is { t: number; balance: number } => Number.isFinite(s.t) && Number.isFinite(s.balance));
 	if (usable.length < BURN_MIN_COUNT) return null;
 	let start = usable.length - 1;
 	while (start > 0 && usable[start - 1].balance >= usable[start].balance - MONEY_EPSILON) start -= 1;
@@ -445,6 +446,36 @@ export function estimateBurnRate(snapshots: BalanceSample[]): BurnRate | null {
 	const drop = window[0].balance - window[window.length - 1].balance;
 	if (drop <= MONEY_EPSILON) return null;
 	return { perHour: (drop / span) * 3_600_000, windowHours: span / 3_600_000 };
+}
+
+/** Per-key series discriminator: HMAC(label) — stable, non-secret, distinct from account fingerprints. */
+export function keyDiscriminator(label: string | undefined): string {
+	return fingerprintOf(undefined, label ? `key:${label}` : "");
+}
+
+/**
+ * Burn rate from a per-key usage series. Usage is monotonic per key, but
+ * key switches and accounting resets can decrease it: any drop starts a new
+ * segment (same walkback shape as the balance top-ups). Same gates as the
+ * balance estimator PLUS a minimum absolute delta (cents quantization).
+ */
+export function estimateKeyBurnRate(snapshots: StoreBalanceRow[]): BurnRate | null {
+	const usable = snapshots.filter((sx): sx is StoreBalanceRow & { keyUsage: number } => Number.isFinite(sx.t) && Number.isFinite(sx.keyUsage ?? NaN));
+	if (usable.length < BURN_MIN_COUNT) return null;
+	// Segment on the LAST key discriminator; drops inside a segment restart it.
+	let start = usable.length - 1;
+	while (
+		start > 0 &&
+		usable[start - 1].keyFp === usable[usable.length - 1].keyFp &&
+		usable[start - 1].keyUsage! <= usable[start].keyUsage! + MONEY_EPSILON
+	) start -= 1;
+	const window = usable.slice(start);
+	if (window.length < BURN_MIN_COUNT) return null;
+	const span = window[window.length - 1].t - window[0].t;
+	if (span < BURN_MIN_SPAN_MS) return null;
+	const rise = window[window.length - 1].keyUsage! - window[0].keyUsage!;
+	if (rise < 0.01) return null; // cent quantization floor
+	return { perHour: (rise / span) * 3_600_000, windowHours: span / 3_600_000 };
 }
 
 export function runwayHours(balance: number, perHour: number): number | null {
@@ -524,6 +555,15 @@ const MESSAGES: Record<Lang, Record<string, (v: MsgVars) => string>> = {
 		alertInsufficient: () => "OpenRouter no credits left.",
 		alertRecovered: () => "",
 		reportSummary: (v) => `OpenRouter balance ${v.balance}`,
+		rateModeTitle: () => "Rate display",
+		rateModeOptionKey: () => "This key (default)",
+		rateModeOptionAccount: () => "Account",
+		rateModeOptionBoth: () => "Both",
+		rateModeOptionHidden: () => "Hide",
+		rateModeSet: (v) => `Rate display: ${v.mode}.${v.suffix ?? ""}`,
+		rateModeCleared: (v) => `Rate display reset to default.${v.suffix}`,
+		rateModeStatus: (v) => `Rate display: ${v.mode} (${v.source}).`,
+		rateModeRestricted: () => "pi-openrouter-balance: rate-mode requires TUI or print mode.",
 		ageJustNow: () => "just now",
 		ageSec: (v) => `${v.n}s ago`,
 		ageMin: (v) => `${v.n}m ago`,
@@ -573,6 +613,15 @@ const MESSAGES: Record<Lang, Record<string, (v: MsgVars) => string>> = {
 		alertInsufficient: () => "OpenRouter 额度用尽。",
 		alertRecovered: () => "",
 		reportSummary: (v) => `OpenRouter 余额 ${v.balance}`,
+		rateModeTitle: () => "速率显示",
+		rateModeOptionKey: () => "当前密钥消耗速率（默认）",
+		rateModeOptionAccount: () => "账户消耗速率",
+		rateModeOptionBoth: () => "两个都显示",
+		rateModeOptionHidden: () => "不显示",
+		rateModeSet: (v) => `速率显示：${v.mode}。${v.suffix ?? ""}`,
+		rateModeCleared: (v) => `速率显示已恢复默认。${v.suffix}`,
+		rateModeStatus: (v) => `速率显示：${v.mode}（${v.source}）。`,
+		rateModeRestricted: () => "pi-openrouter-balance：rate 需要在 TUI 或 print 模式执行。",
 		ageJustNow: () => "刚刚",
 		ageSec: (v) => `${v.n} 秒前`,
 		ageMin: (v) => `${v.n} 分钟前`,
@@ -637,12 +686,15 @@ export function remainingRatioHealth(ratio: number): string {
 	return "error";
 }
 
+export type RateMode = "key" | "account" | "both" | "hidden";
+
 export interface FooterOpts {
 	now: number;
 	stale?: boolean;
 	freeModel?: boolean;
 	theme?: FooterTheme;
 	lang?: Lang;
+	rateMode?: RateMode;
 }
 
 const HOUR_MS = 3_600_000;
@@ -658,7 +710,19 @@ export function renderFooter(snapshot: Snapshot, opts: FooterOpts): string {
 	const theme = opts.theme ?? identityTheme;
 	const lang = opts.lang ?? "en";
 	const label = "openrouter";
-	const rateText = snapshot.burnRate ? ` ↓${formatBurn(snapshot.burnRate, lang)}` : "";
+	const rateMode = opts.rateMode ?? "key";
+	const rateParts: string[] = [];
+	const account = snapshot.burnRate ? formatBurn(snapshot.burnRate, lang) : undefined;
+	const key = snapshot.keyBurnRate ? formatBurn(snapshot.keyBurnRate, lang) : undefined;
+	if (rateMode === "key" && key) {
+		rateParts.push(lang === "zh" ? `当前密钥消耗速率 ↓${key}` : `↓${key} (this key)`);
+	} else if (rateMode === "account" && account) {
+		rateParts.push(lang === "zh" ? `账户消耗速率 ↓${account}` : `↓${account} (account)`);
+	} else if (rateMode === "both") {
+		if (key) rateParts.push(lang === "zh" ? `当前密钥消耗速率 ↓${key}` : `↓${key} (this key)`);
+		if (account) rateParts.push(lang === "zh" ? `账户消耗速率 ↓${account}` : `↓${account} (account)`);
+	}
+	const rateText = rateParts.length > 0 ? ` ${rateParts.join(lang === "zh" ? " · " : " · ")}` : "";
 	let base = "";
 	if (snapshot.account) {
 		base = `${formatMoney(snapshot.account.balance)}`;
@@ -730,9 +794,8 @@ export function buildReportLines(snapshot: Snapshot, opts: ReportOpts): string[]
 	if (k.byokUsage && k.byokUsage > 0) {
 		lines.push(`  ${msg(lang, "byok")}: ${formatMoney(k.byokUsage)}`);
 	}
-	if (snapshot.burnRate) {
-		lines.push(`  ${lang === "zh" ? "消耗速率" : "Burn rate"}: ↓${formatBurn(snapshot.burnRate, lang)}`);
-	}
+	lines.push(`  ${lang === "zh" ? "账户消耗速率" : "Account burn rate"}: ${snapshot.burnRate ? `↓${formatBurn(snapshot.burnRate, lang)}${lang === "zh" ? "（含全部密钥与网页端）" : " (all keys + web)"}` : msg(lang, "nA")}`);
+	lines.push(`  ${lang === "zh" ? "当前密钥消耗速率" : "Current key burn rate"}: ${snapshot.keyBurnRate ? `↓${formatBurn(snapshot.keyBurnRate, lang)}${lang === "zh" ? "（该密钥所有调用者）" : " (all callers of this key)"}` : msg(lang, "nA")}`);
 	if (opts.runwayHours != null && opts.runwayHours > 0) {
 		lines.push(`  ${lang === "zh" ? "余额可用时长" : "Runway"}: ${formatRunway(opts.runwayHours, lang)}`);
 	}
@@ -777,6 +840,7 @@ export function toJsonPayload(snapshot: Snapshot, opts: { stale?: boolean; runwa
 			...(snapshot.key.expiresAt ? { expiresAt: snapshot.key.expiresAt } : {}),
 		},
 		...(snapshot.burnRate ? { burnRate: { perHour: snapshot.burnRate.perHour, windowHours: snapshot.burnRate.windowHours } } : {}),
+		...(snapshot.keyBurnRate ? { keyBurnRate: { perHour: snapshot.keyBurnRate.perHour, windowHours: snapshot.keyBurnRate.windowHours } } : {}),
 		...(opts.runwayHours != null ? { runwayHours: opts.runwayHours } : {}),
 		warnings: snapshot.warnings,
 	};
@@ -1134,7 +1198,9 @@ export function createOverlayComponent(opts: OverlayComponentOpts): OverlayCompo
 export interface StoreBalanceRow {
 	t: number;
 	fingerprint: string;
-	balance: number;
+	balance?: number;
+	keyFp?: string;
+	keyUsage?: number;
 }
 
 export interface BalanceStoreLike {
@@ -1148,6 +1214,21 @@ export interface StoreIo {
 	writeFile(p: string, s: string): void;
 	rename(from: string, to: string): void;
 	mkdir(p: string): void;
+}
+
+export const PREFS_FILE_NAME = "pi-openrouter-balance-prefs.json";
+
+export function parsePrefs(raw: string | null): { rateMode?: RateMode } {
+	if (!raw) return {};
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		if (!isRecord(parsed)) return {};
+		const burn = parsed["rateMode"] ?? parsed["footerRate"] ?? parsed["rate"] ?? parsed["burn"]; // canonical rateMode; earlier keys tolerated
+		if (burn === "key" || burn === "account" || burn === "both" || burn === "hidden") return { rateMode: burn };
+		return {};
+	} catch {
+		return {};
+	}
 }
 
 export const SNAPSHOT_KEEP = 500;
@@ -1173,9 +1254,18 @@ export function createBalanceStore(dir: string, io: StoreIo): BalanceStoreLike {
 			try {
 				const r = JSON.parse(t) as unknown;
 				if (!isRecord(r)) continue;
-				if (typeof r["t"] !== "number" || typeof r["fingerprint"] !== "string" || typeof r["balance"] !== "number") continue;
+				if (typeof r["t"] !== "number" || typeof r["fingerprint"] !== "string") continue;
+				const hasBalance = typeof r["balance"] === "number";
+				const hasKeyUsage = typeof r["keyUsage"] === "number";
+				if (!hasBalance && !hasKeyUsage) continue;
 				if (!rowHygienic(r)) continue;
-				out.push({ t: r["t"], fingerprint: r["fingerprint"], balance: r["balance"] });
+				out.push({
+					t: r["t"],
+					fingerprint: r["fingerprint"],
+					...(hasBalance ? { balance: r["balance"] as number } : {}),
+					...(typeof r["keyFp"] === "string" ? { keyFp: r["keyFp"] } : {}),
+					...(hasKeyUsage ? { keyUsage: r["keyUsage"] as number } : {}),
+				});
 			} catch {
 				// skip corrupt lines
 			}
@@ -1190,7 +1280,7 @@ export function createBalanceStore(dir: string, io: StoreIo): BalanceStoreLike {
 				all.push(row);
 				if (all.length > SNAPSHOT_COMPACT_AT) {
 					const kept = all.slice(-SNAPSHOT_KEEP);
-					const tmp = `${file}.tmp`;
+					const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 					io.writeFile(tmp, kept.map((r) => JSON.stringify(r)).join("\n") + "\n");
 					io.rename(tmp, file);
 				} else {
@@ -1288,6 +1378,8 @@ export type TimerHandle = ReturnType<typeof setTimeout> & { unref?: () => void }
 export interface UiLike {
 	setStatus(key: string, text: string | undefined): void;
 	notify(message: string, level: "info" | "warning" | "error"): void;
+	select?(title: string, options: string[], opts?: unknown): Promise<string | undefined>;
+	confirm?(title: string, message: string, opts?: unknown): Promise<boolean>;
 	theme: FooterTheme;
 	custom?(
 		factory: (tui: unknown, theme: FooterTheme, kb: KeyLike, done: (value: unknown) => void) => OverlayComponent,
@@ -1306,6 +1398,9 @@ export interface ExtensionDeps {
 	clientFor(): UsageClientLike;
 	authFor(ctx: CtxLike): Promise<AuthResolution>;
 	store?: BalanceStoreLike;
+	prefsRead?: () => string | null;
+	prefsWrite?: (text: string) => void;
+	prefsDir?: string;
 	warnThreshold?: () => number;
 	errorThreshold?: () => number;
 }
@@ -1346,6 +1441,23 @@ export function createExtension(deps: ExtensionDeps) {
 	const isInteractive = (ctx: CtxLike) => deps.interactive?.(ctx) ?? ctx.mode === "tui";
 	const lang = resolveLang(deps.env ?? {});
 	const store = deps.store ?? { append() { /* */ }, load: () => [] };
+	let ratePref: RateMode | undefined = (() => {
+		try {
+			const parsed = parsePrefs(deps.prefsRead?.() ?? null);
+			return parsed.rateMode;
+		} catch {
+			return undefined;
+		}
+	})();
+	const validEnvRate = (): RateMode | undefined => {
+		const v = deps.env?.["PI_OPENROUTER_BALANCE_RATE_MODE"];
+		if (v === "key" || v === "account" || v === "both" || v === "hidden") return v;
+		return undefined;
+	};
+	const resolveRateMode = (): RateMode => {
+		// 12-factor convention: env > persisted command > default (key).
+		return validEnvRate() ?? ratePref ?? "key";
+	};
 	const warnThreshold = () => {
 		if (deps.warnThreshold) return deps.warnThreshold();
 		const v = Number(deps.env?.["PI_OPENROUTER_BALANCE_WARN"]);
@@ -1408,6 +1520,7 @@ export function createExtension(deps: ExtensionDeps) {
 				freeModel: s.lastCtx?.model?.id?.toLowerCase().endsWith(":free") === true,
 				theme,
 				lang,
+				rateMode: resolveRateMode(),
 			});
 			return s.insufficient ? `${label} ${theme.fg("error", msg(lang, "insufficient"))}` : out;
 		}
@@ -1507,18 +1620,15 @@ export function createExtension(deps: ExtensionDeps) {
 					s.insufficient = result.snapshot.insufficient === true;
 					deps.clientFor().resetBreaker();
 					const snap = result.snapshot;
-					// fingerprint switch: drop burn history and rebase
+					// fingerprint switch: rate history is keyed by fingerprint, so a
+					// new account naturally starts fresh; alerts re-arm too.
 					if (s.fingerprint !== null && s.fingerprint !== snap.fingerprint) {
 						s.alertState = null;
 					}
 					s.fingerprint = snap.fingerprint;
-					s.snapshot = snap;
+					s.snapshot = appendAndRate(snap);
 					s.stale = false;
 					s.lastOkFetchAt = now();
-					if (snap.key.userId && snap.account) store.append({ t: now(), fingerprint: snap.fingerprint, balance: snap.account.balance });
-					const series = snap.key.userId ? store.load(snap.fingerprint) : [];
-					const rate = snap.key.userId ? estimateBurnRate(series) : null;
-					s.snapshot = rate ? { ...snap, burnRate: rate } : snap;
 					emitAlerts(ctx);
 				} else if (result.status === "retry") {
 					s.retryDeadline = Math.max(s.retryDeadline, now() + result.retryAfterMs);
@@ -1573,6 +1683,24 @@ export function createExtension(deps: ExtensionDeps) {
 			} finally {
 				if (gen === s.generation) s.inFlight = false;
 			}
+		}
+
+		/** Append a persistence row (balance and/or key usage, whichever exists) and derive both rates. */
+		function appendAndRate(snap: Snapshot): Snapshot {
+			const keyFp = snap.key.label ? keyDiscriminator(snap.key.label) : undefined;
+			if (snap.key.userId) {
+				const row: { t: number; fingerprint: string; balance?: number; keyFp?: string; keyUsage?: number } = { t: now(), fingerprint: snap.fingerprint };
+				if (snap.account) row.balance = snap.account.balance;
+				if (keyFp && snap.key.usage > 0) {
+					row.keyFp = keyFp;
+					row.keyUsage = snap.key.usage;
+				}
+				if (row.balance !== undefined || row.keyUsage !== undefined) store.append(row);
+			}
+			const series = snap.key.userId ? store.load(snap.fingerprint) : [];
+			const rate = snap.key.userId ? estimateBurnRate(series) : null;
+			const keyRate = snap.key.userId && snap.key.label ? estimateKeyBurnRate(series) : null;
+			return rate || keyRate ? { ...snap, ...(rate ? { burnRate: rate } : {}), ...(keyRate ? { keyBurnRate: keyRate } : {}) } : snap;
 		}
 
 		function isStaleCtxReason(error: unknown): boolean {
@@ -1647,6 +1775,12 @@ export function createExtension(deps: ExtensionDeps) {
 				const items = [
 					{ value: "--json", label: "--json", description: "Stable JSON snapshot" },
 					{ value: "--refresh", label: "--refresh", description: "Bypass throttling" },
+					{ value: "rate-mode", label: "rate-mode", description: "Choose how the burn rate is shown (this key / account / both / hidden)" },
+					{ value: "rate-mode key", label: "rate-mode key", description: "Show this key's burn rate (default)" },
+					{ value: "rate-mode account", label: "rate-mode account", description: "Show the account burn rate" },
+					{ value: "rate-mode both", label: "rate-mode both", description: "Show both rates" },
+					{ value: "rate-mode hidden", label: "rate-mode hidden", description: "Hide the rate" },
+					{ value: "rate-mode clear", label: "rate-mode clear", description: "Reset to the default (env still applies if set)" },
 				];
 				const filtered = items.filter((i) => i.value.startsWith(prefix));
 				return filtered.length > 0 ? filtered : null;
@@ -1658,6 +1792,10 @@ export function createExtension(deps: ExtensionDeps) {
 					const parsed = parseCommandArgs(args);
 					if (parsed.error) {
 						ui.notify(msg(lang, "unknownArgs", { arg: parsed.error.arg }), "error");
+						return;
+					}
+					if (parsed.rateModeInvoked) {
+						await rateModeCommand(ctx, parsed.rateMode);
 						return;
 					}
 					if (parsed.json && ctx.mode !== "tui" && ctx.mode !== "print") {
@@ -1680,10 +1818,7 @@ export function createExtension(deps: ExtensionDeps) {
 						return;
 					}
 					const snap = result.snapshot;
-					if (snap.key.userId && snap.account) store.append({ t: now(), fingerprint: snap.fingerprint, balance: snap.account.balance });
-					const series = snap.key.userId ? store.load(snap.fingerprint) : [];
-					const rate = snap.key.userId ? estimateBurnRate(series) : null;
-					const finalSnap = rate ? { ...snap, burnRate: rate } : snap;
+					const finalSnap = appendAndRate(snap);
 					if (s.active && ctx.model?.provider === PROVIDER_ID) {
 						s.lastCtx = ctx;
 						s.snapshot = finalSnap;
@@ -1692,7 +1827,7 @@ export function createExtension(deps: ExtensionDeps) {
 						s.lastOkFetchAt = now();
 						render();
 					}
-					const runway = finalSnap.account ? runwayHours(finalSnap.account.balance, rate?.perHour ?? 0) : null;
+					const runway = finalSnap.account ? runwayHours(finalSnap.account.balance, finalSnap.burnRate?.perHour ?? 0) : null;
 					if (parsed.json) {
 						const payload = JSON.stringify(toJsonPayload(finalSnap, { stale: s.active ? s.stale : false, runwayHours: runway }), null, 2);
 						if (ctx.mode === "tui") {
@@ -1718,6 +1853,69 @@ export function createExtension(deps: ExtensionDeps) {
 			},
 		});
 
+		async function rateModeCommand(ctx: CtxLike, action: "key" | "account" | "both" | "hidden" | "clear" | "status" | undefined): Promise<void> {
+			const ui = ctx.ui as UiLike | undefined;
+			if (!ui) return;
+			if (ctx.mode === "json" || ctx.mode === "rpc") {
+				ui.notify(msg(lang, "rateModeRestricted"), "warning");
+				return;
+			}
+			const envMode = validEnvRate();
+			const modeLabel = (m: RateMode) =>
+				m === "key" ? (lang === "zh" ? "当前密钥消耗速率" : "this key")
+				: m === "account" ? (lang === "zh" ? "账户消耗速率" : "account")
+				: m === "both" ? (lang === "zh" ? "两个都显示" : "both")
+				: (lang === "zh" ? "不显示" : "hidden");
+			const applyMode = (m: RateMode | undefined) => {
+				ratePref = m;
+				try {
+					deps.prefsWrite?.(JSON.stringify(m ? { rateMode: m } : {}));
+				} catch {
+					ratePref = undefined;
+					ui.notify(msg(lang, "rateModeSaveFailed"), "error");
+					return false;
+				}
+				if (s.active) render();
+				return true;
+			};
+			if (action === undefined) {
+				if (ctx.mode !== "tui" || !ui.select) {
+					const source = envMode ? (lang === "zh" ? "环境变量" : "env") : ratePref ? (lang === "zh" ? "命令设置" : "command") : (lang === "zh" ? "默认" : "default");
+					ui.notify(msg(lang, "rateModeStatus", { mode: modeLabel(resolveRateMode()), source }), "info");
+					return;
+				}
+				const choice = await ui.select(`${msg(lang, "rateModeTitle")} — ${modeLabel(resolveRateMode())}`, [
+					msg(lang, "rateModeOptionKey"),
+					msg(lang, "rateModeOptionAccount"),
+					msg(lang, "rateModeOptionBoth"),
+					msg(lang, "rateModeOptionHidden"),
+				]);
+				if (choice === undefined) return;
+				// pi's select resolves the chosen OPTION STRING (interactive-mode
+				// resolves option in the selector callback) — match by label.
+				const pick: RateMode =
+					choice === msg(lang, "rateModeOptionAccount") ? "account"
+					: choice === msg(lang, "rateModeOptionBoth") ? "both"
+					: choice === msg(lang, "rateModeOptionHidden") ? "hidden"
+					: "key";
+				applyMode(pick);
+				ui.notify(msg(lang, "rateModeSet", { mode: modeLabel(pick), suffix: envMode ? (lang === "zh" ? "（环境变量优先，当前未生效）" : " (env takes precedence; not active yet)") : "" }), "info");
+				return;
+			}
+			if (action === "status") {
+				const source = envMode ? (lang === "zh" ? "环境变量" : "env") : ratePref ? (lang === "zh" ? "命令设置" : "command") : (lang === "zh" ? "默认" : "default");
+				ui.notify(msg(lang, "rateModeStatus", { mode: modeLabel(resolveRateMode()), source }), "info");
+				return;
+			}
+			if (action === "clear") {
+				applyMode(undefined);
+				ui.notify(msg(lang, "rateModeCleared", { suffix: envMode ? (lang === "zh" ? "（环境变量仍生效）" : " (env still applies)") : "" }), "info");
+				return;
+			}
+			applyMode(action);
+			ui.notify(msg(lang, "rateModeSet", { mode: modeLabel(action), suffix: envMode ? (lang === "zh" ? "（环境变量优先，当前未生效）" : " (env takes precedence; not active yet)") : "" }), "info");
+		}
+
 		async function showOverlay(ctx: CtxLike, body: string[], header: string): Promise<void> {
 			const ui = ctx.ui as UiLike | undefined;
 			if (!ui?.custom) return;
@@ -1741,22 +1939,72 @@ export function createExtension(deps: ExtensionDeps) {
 	};
 }
 
-function parseCommandArgs(args: string): { refresh: boolean; json: boolean; error?: { arg: string } } {
+function parseCommandArgs(args: string): { refresh: boolean; json: boolean; rateModeInvoked?: boolean; rateMode?: "key" | "account" | "both" | "hidden" | "clear" | "status"; error?: { arg: string } } {
 	const tokens = args.trim().split(/\s+/).filter(Boolean);
 	let refresh = false;
 	let json = false;
-	for (const token of tokens) {
+	let rateModeArg: "key" | "account" | "both" | "hidden" | "clear" | "status" | undefined;
+	let rateModeInvoked = false;
+	for (let i = 0; i < tokens.length; i += 1) {
+		const token = tokens[i];
 		if (token === "--refresh") refresh = true;
 		else if (token === "--json") json = true;
-		else return { refresh: true, json: false, error: { arg: token } };
+		else if (token === "rate-mode") {
+			rateModeInvoked = true;
+			const next = tokens[i + 1];
+			if (next === "key" || next === "account" || next === "both" || next === "hidden" || next === "clear" || next === "status") {
+				rateModeArg = next;
+				i += 1;
+			}
+		} else {
+			return { refresh: true, json: false, error: { arg: token } };
+		}
 	}
-	return { refresh, json };
+	return { refresh, json, rateModeInvoked, ...(rateModeArg ? { rateMode: rateModeArg } : {}) };
 }
 
 export default function openRouterBalanceInstall(pi: unknown): void {
 	const env = process.env as Record<string, string | undefined>;
 	const homedir = nodeOs.homedir();
 	const dir = env["PI_CODING_AGENT_DIR"] ?? nodePath.join(homedir, ".pi", "agent");
+	const prefsFile = nodePath.join(dir, PREFS_FILE_NAME);
+	const prefsIo = {
+		read: () => {
+			try {
+				// Hygiene (R1 review rules, TOCTOU-safe): open with O_NOFOLLOW, then
+				// fstat the descriptor; reject non-regular and world-readable files.
+				const fd = nodeFs.openSync(prefsFile, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW);
+				try {
+					const st = nodeFs.fstatSync(fd);
+					if (!st.isFile() || st.mode & 0o077) return null;
+					return nodeFs.readFileSync(fd, "utf8");
+				} finally {
+					nodeFs.closeSync(fd);
+				}
+			} catch {
+				return null;
+			}
+		},
+		write: (text: string) => {
+			try {
+				nodeFs.mkdirSync(dir, { recursive: true });
+				let tmp = `${prefsFile}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+				let attempts = 0;
+				while (true) {
+					try {
+						nodeFs.writeFileSync(tmp, text, { mode: 0o600, flag: "wx" });
+						break;
+					} catch (e) {
+						if ((e as NodeJS.ErrnoException).code !== "EEXIST" || attempts++ > 5) throw e;
+						tmp = `${prefsFile}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+					}
+				}
+				nodeFs.renameSync(tmp, prefsFile);
+			} catch {
+				throw new UsageError("parse", "could not save the rate-mode preference");
+			}
+		},
+	};
 	const store = createBalanceStore(dir, {
 		readFile: (p) => {
 			try { return nodeFs.readFileSync(p, "utf8"); } catch { return null; }
@@ -1780,5 +2028,7 @@ export default function openRouterBalanceInstall(pi: unknown): void {
 		clientFor: () => client,
 		authFor: (ctx) => resolveOpenRouterAuth(ctx),
 		store,
+		prefsRead: prefsIo.read,
+		prefsWrite: prefsIo.write,
 	})(pi);
 }

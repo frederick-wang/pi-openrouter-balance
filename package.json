@@ -1,6 +1,6 @@
 {
   "name": "pi-openrouter-balance",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenRouter account balance and key usage in the pi footer — balance, per-key limits, period spends, burn rate, /openrouter-balance report. Unofficial, not affiliated with OpenRouter.",
   "type": "module",
   "license": "MIT",

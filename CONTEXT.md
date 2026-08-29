@@ -24,6 +24,17 @@ _Avoid_: reset date
 Usage counters for today/week/month in UTC (week starts Monday); server-computed, never estimated.
 _Avoid_: usage（泛指时区分）— 今日/本周/本月用量
 
+**Account burn rate**:
+The burn of the whole account (all keys + web), estimated from the account balance series; shown with the wallet numbers.
+_Avoid_: 消耗速率（泛指时）
+
+**Current key burn rate**:
+The burn attributed to the active key, estimated from the per-key usage series (all callers of that key).
+_Avoid_: 密钥消耗（无速率语境）, key rate
+
+**Rate display mode**:
+Which rate the footer shows: this-key (default), account, both, hidden; set by /openrouter-balance rate-mode (persisted) or PI_OPENROUTER_BALANCE_RATE_MODE (env wins).
+
 **Burn rate**:
 Credits drained per hour, estimated from the account balance snapshot series; top-ups open a new segment.
 _Avoid_: consumption rate, 花费速度
