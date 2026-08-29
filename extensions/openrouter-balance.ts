@@ -777,12 +777,976 @@ export function toJsonPayload(snapshot: Snapshot, opts: { stale?: boolean; runwa
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Extension placeholder (lifecycle lands in T03)
+// Terminal text helpers (ported from the pi-xai-usage overlay contract)
 // ─────────────────────────────────────────────────────────────────────────────
-export function openRouterBalanceInstall(_pi: unknown): void {
-	// Lifecycle lands in T03.
+
+export function visualWidth(s: string): number {
+	let w = 0;
+	for (let i = 0; i < s.length; ) {
+		const cp = s.codePointAt(i) ?? 0;
+		if (cp === 0x1b) {
+			i = skipEscape(s, i);
+			continue;
+		}
+		w += isWideChar(cp) ? 2 : 1;
+		i += cp > 0xffff ? 2 : 1;
+	}
+	return w;
 }
 
-export default function openRouterBalance(pi: unknown): void {
-	openRouterBalanceInstall(pi);
+function skipEscape(s: string, i: number): number {
+	if (s[i + 1] === "]") {
+		let j = i + 2;
+		while (j < s.length) {
+			const b = s.charCodeAt(j);
+			if (b === 0x07) {
+				j += 1;
+				break;
+			}
+			if (b === 0x1b && s[j + 1] === "\\") {
+				j += 2;
+				break;
+			}
+			j += 1;
+		}
+		return j;
+	}
+	let j = i + 1;
+	while (j < s.length) {
+		const b = s.charCodeAt(j);
+		if (b >= 0x40 && b <= 0x7e && b !== 0x5b && b !== 0x5d) {
+			j += 1;
+			break;
+		}
+		j += 1;
+	}
+	return j;
+}
+
+function isWideChar(cp: number): boolean {
+	return (
+		(cp >= 0x1100 && cp <= 0x115f) ||
+		(cp >= 0x2e80 && cp <= 0xa4cf) ||
+		(cp >= 0xac00 && cp <= 0xd7a3) ||
+		(cp >= 0xf900 && cp <= 0xfaff) ||
+		(cp >= 0xfe30 && cp <= 0xfe4f) ||
+		(cp >= 0xff00 && cp <= 0xff60) ||
+		(cp >= 0xffe0 && cp <= 0xffe6) ||
+		(cp >= 0x1f300 && cp <= 0x1f64f) ||
+		(cp >= 0x1f900 && cp <= 0x1f9ff) ||
+		(cp >= 0x20000 && cp <= 0x3fffd)
+	);
+}
+
+export function wrapLines(lines: string[], width: number): string[] {
+	if (width <= 0) return [...lines];
+	const out: string[] = [];
+	for (const line of lines) {
+		if (visualWidth(line) <= width) {
+			out.push(line);
+			continue;
+		}
+		const tokens = ansiTokens(line);
+		const wrapped: string[] = [];
+		let cur = "";
+		let curW = 0;
+		for (const tok of tokens) {
+			if (tok.ansi) {
+				cur += tok.s;
+				continue;
+			}
+			const cw = isWideChar(tok.cp) ? 2 : 1;
+			if (curW + cw > width && visibleCharCount(cur) > 0) {
+				wrapped.push(cur);
+				cur = cw <= width ? tok.s : "";
+				curW = cw <= width ? cw : 0;
+			} else if (cw > width) {
+				cur = "";
+				curW = 0;
+			} else {
+				cur += tok.s;
+				curW += cw;
+			}
+		}
+		if (cur.length > 0) wrapped.push(cur);
+		const { ansiPrefix } = splitAnsi(line);
+		const styleOnly = ansiPrefix.replace(/\s/g, "");
+		for (let k = 0; k < wrapped.length; k++) {
+			out.push(k === 0 ? wrapped[k] : `${styleOnly}${wrapped[k]}`);
+		}
+	}
+	return out;
+}
+
+function visibleCharCount(s: string): number {
+	let n = 0;
+	let i = 0;
+	while (i < s.length) {
+		if (s[i] === "\x1b") {
+			i = skipEscape(s, i);
+		} else {
+			const cp = s.codePointAt(i) ?? 0;
+			n += 1;
+			i += cp > 0xffff ? 2 : 1;
+		}
+	}
+	return n;
+}
+
+function padToWidth(line: string, width: number): string {
+	const cur = visualWidth(line);
+	return cur >= width ? line : `${line}${String.fromCharCode(32).repeat(width - cur)}`;
+}
+
+function clampChrome(line: string, width: number): string {
+	if (visualWidth(line) <= width) return line;
+	const tokens = ansiTokens(line);
+	let out = "";
+	let w = 0;
+	let sawVisible = false;
+	for (const tok of tokens) {
+		if (tok.ansi) {
+			out += tok.s;
+			continue;
+		}
+		const cw = isWideChar(tok.cp) ? 2 : 1;
+		if (!sawVisible && tok.s.trim() === "") {
+			if (w + cw > width) break;
+			out += tok.s;
+			w += cw;
+			continue;
+		}
+		if (w + cw > width && w > 0) break;
+		out += tok.s;
+		w += cw;
+		sawVisible = true;
+	}
+	return out;
+}
+
+interface AnsiToken {
+	ansi: boolean;
+	s: string;
+	cp: number;
+}
+
+function ansiTokens(line: string): AnsiToken[] {
+	const tokens: AnsiToken[] = [];
+	let i = 0;
+	while (i < line.length) {
+		if (line[i] === "\x1b") {
+			const j = skipEscape(line, i);
+			tokens.push({ ansi: true, s: line.slice(i, j), cp: 0 });
+			i = j;
+		} else {
+			const cp = line.codePointAt(i) ?? 0;
+			const ch = String.fromCodePoint(cp);
+			tokens.push({ ansi: false, s: ch, cp });
+			i += cp > 0xffff ? 2 : 1;
+		}
+	}
+	return tokens;
+}
+
+function splitAnsi(line: string): { text: string; ansiPrefix: string; ansiSuffix: string } {
+	const tokens = ansiTokens(line);
+	let prefix = "";
+	let start = 0;
+	while (start < tokens.length && (tokens[start].ansi || tokens[start].s.trim() === "")) {
+		prefix += tokens[start].s;
+		start += 1;
+	}
+	let suffix = "";
+	let end = tokens.length;
+	while (end > start && tokens[end - 1].ansi) {
+		suffix = tokens[end - 1].s + suffix;
+		end -= 1;
+	}
+	return { text: tokens.slice(start, end).map((t) => t.s).join(""), ansiPrefix: prefix, ansiSuffix: suffix };
+}
+
+export function clampScrollTop(scrollTop: number, bodyLength: number, avail: number): number {
+	const max = Math.max(0, bodyLength - avail);
+	return Math.min(Math.max(0, scrollTop), max);
+}
+
+export interface WindowResult {
+	top: number;
+	lines: string[];
+	atEnd: boolean;
+}
+
+export function windowSlice(body: string[], scrollTop: number, avail: number): WindowResult {
+	const top = clampScrollTop(scrollTop, body.length, avail);
+	return {
+		top,
+		lines: body.slice(top, top + avail),
+		atEnd: top >= Math.max(0, body.length - avail),
+	};
+}
+
+export interface KeyLike {
+	matches(data: string, id: string): boolean;
+}
+
+export interface OverlayComponent {
+	render(width: number): string[];
+	invalidate(): void;
+	handleInput(data: string): void;
+}
+
+export interface OverlayComponentOpts {
+	header: string;
+	body: string[];
+	footer: string;
+	theme: FooterTheme;
+	kb: KeyLike;
+	done: (value: unknown) => void;
+	rowGen: () => number;
+	lang: Lang;
+}
+
+export function createOverlayComponent(opts: OverlayComponentOpts): OverlayComponent {
+	const { header, body, footer, theme, kb, done, rowGen, lang } = opts;
+	let scrollTop = 0;
+	let closed = false;
+	let lastWidth = 80;
+	const body0 = body[0] === "" ? body.slice(1) : body;
+
+	const close = () => {
+		if (closed) return;
+		closed = true;
+		done(undefined);
+	};
+
+	function maxRowsAt(): number {
+		return Math.max(1, Math.floor(rowGen() * 0.8));
+	}
+
+	function layout(width: number): { avail: number; canStatus: boolean; boxed: boolean } {
+		const maxRows = maxRowsAt();
+		const boxed = maxRows >= 6 && width >= 8;
+		const chrome = boxed ? 5 : 3;
+		const avail = Math.max(0, maxRows - chrome);
+		const canStatus = boxed && maxRows >= chrome + 3;
+		return { avail, canStatus, boxed };
+	}
+
+	function scrollWindowAt(w: number): { bodyLines: string[]; avail: number; needsStatus: boolean } {
+		const innerW = Math.max(1, w - 2);
+		const bodyLines = wrapLines(body0, innerW);
+		const { avail, canStatus } = layout(w);
+		const needsStatus = canStatus && bodyLines.length > avail;
+		const bodyAvail = needsStatus ? Math.max(0, avail - 2) : avail;
+		return { bodyLines, avail: bodyAvail, needsStatus };
+	}
+
+	function renderLines(width: number): string[] {
+		const w = Math.max(1, width);
+		const innerW = Math.max(1, w - 2);
+		const { bodyLines, avail: bodyAvail, needsStatus } = scrollWindowAt(w);
+		const { boxed } = layout(w);
+		const win = windowSlice(bodyLines, scrollTop, bodyAvail);
+		scrollTop = win.top;
+		const statusRow = needsStatus
+			? clampChrome(`  ${theme.fg("muted", msg(lang, "scrollStatus", { pos: win.atEnd ? bodyLines.length : win.top + win.lines.length, total: bodyLines.length }))}`, innerW)
+			: null;
+		const footerText = innerW < 20 ? msg(lang, "pressCloseShort") : footer;
+		const footerRow = clampChrome(`  ${theme.fg("dim", footerText)}`, innerW);
+		const titleRow = clampChrome(`  ${theme.fg("accent", header)}`, innerW);
+		const blocks: string[] = [""];
+		blocks.push(...win.lines);
+		if (statusRow) {
+			blocks.push("");
+			blocks.push(statusRow);
+		}
+		blocks.push("");
+		blocks.push(footerRow);
+		if (!boxed) {
+			const out: string[] = [titleRow];
+			if (win.lines.length > 0) out.push("", ...win.lines);
+			if (statusRow) out.push("", statusRow);
+			out.push(footerRow);
+			return out;
+		}
+		const titleStr = clampChrome(` ${theme.fg("accent", header)} `, innerW);
+		const titleW = visualWidth(titleStr);
+		const pad = Math.max(0, innerW - titleW);
+		const topPad = Math.floor(pad / 2);
+		const topPad2 = pad - topPad;
+		const top = theme.fg("border", "╭") + theme.fg("border", "─".repeat(topPad)) + titleStr + theme.fg("border", "─".repeat(topPad2)) + theme.fg("border", "╮");
+		const bottom = theme.fg("border", `╰${"─".repeat(Math.max(0, innerW))}╯`);
+		const out: string[] = [top];
+		for (const line of blocks) {
+			const inner = line === "" ? " ".repeat(innerW) : padToWidth(line, innerW);
+			out.push(`${theme.fg("border", "│")}${inner}${theme.fg("border", "│")}`);
+		}
+		out.push(bottom);
+		return out;
+	}
+
+	return {
+		render(width: number) {
+			lastWidth = Math.max(1, width);
+			return renderLines(lastWidth);
+		},
+		invalidate() {
+			// render() recomputes everything; kept as the pi contract entry.
+		},
+		handleInput(data: string) {
+			if (closed) return;
+			if (kb.matches(data, "tui.select.confirm") || kb.matches(data, "tui.select.cancel")) {
+				close();
+				return;
+			}
+			const w = Math.max(1, lastWidth);
+			const { bodyLines, avail: bodyAvail } = scrollWindowAt(w);
+			const max = Math.max(0, bodyLines.length - bodyAvail);
+			if (kb.matches(data, "tui.select.up")) {
+				scrollTop = clampScrollTop(scrollTop - 1, bodyLines.length, bodyAvail);
+			} else if (kb.matches(data, "tui.select.down")) {
+				scrollTop = clampScrollTop(scrollTop + 1, bodyLines.length, bodyAvail);
+			} else if (kb.matches(data, "tui.select.pageUp") || kb.matches(data, "tui.altScreen.pageUp")) {
+				scrollTop = clampScrollTop(scrollTop - Math.max(1, bodyAvail - 1), bodyLines.length, bodyAvail);
+			} else if (kb.matches(data, "tui.select.pageDown") || kb.matches(data, "tui.altScreen.pageDown")) {
+				scrollTop = clampScrollTop(scrollTop + Math.max(1, bodyAvail - 1), bodyLines.length, bodyAvail);
+			} else if (kb.matches(data, "tui.altScreen.top")) {
+				scrollTop = 0;
+			} else if (kb.matches(data, "tui.altScreen.bottom")) {
+				scrollTop = max;
+			}
+		},
+	};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Snapshot persistence store
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface StoreBalanceRow {
+	t: number;
+	fingerprint: string;
+	balance: number;
+}
+
+export interface BalanceStoreLike {
+	append(row: StoreBalanceRow): void;
+	load(fingerprint: string): StoreBalanceRow[];
+}
+
+export interface StoreIo {
+	readFile(p: string): string | null;
+	appendFile(p: string, s: string): void;
+	writeFile(p: string, s: string): void;
+	rename(from: string, to: string): void;
+	mkdir(p: string): void;
+}
+
+export const SNAPSHOT_KEEP = 500;
+export const SNAPSHOT_COMPACT_AT = 1_000;
+export const SNAPSHOT_FILE_NAME = "pi-openrouter-balance-snapshots.jsonl";
+
+function rowHygienic(raw: unknown): boolean {
+	const text = JSON.stringify(raw);
+	if (!text) return false;
+	const lower = text.toLowerCase();
+	return !lower.includes("sk-or-v") && !lower.includes("authorization") && !lower.includes("bearer") && !lower.includes("api_key");
+}
+
+export function createBalanceStore(dir: string, io: StoreIo): BalanceStoreLike {
+	const file = nodePath.join(dir, SNAPSHOT_FILE_NAME);
+	const parseAll = (): StoreBalanceRow[] => {
+		const raw = io.readFile(file);
+		if (raw === null) return [];
+		const out: StoreBalanceRow[] = [];
+		for (const line of raw.split("\n")) {
+			const t = line.trim();
+			if (!t) continue;
+			try {
+				const r = JSON.parse(t) as unknown;
+				if (!isRecord(r)) continue;
+				if (typeof r["t"] !== "number" || typeof r["fingerprint"] !== "string" || typeof r["balance"] !== "number") continue;
+				if (!rowHygienic(r)) continue;
+				out.push({ t: r["t"], fingerprint: r["fingerprint"], balance: r["balance"] });
+			} catch {
+				// skip corrupt lines
+			}
+		}
+		return out;
+	};
+	return {
+		append(row) {
+			try {
+				io.mkdir(dir);
+				const all = parseAll();
+				all.push(row);
+				if (all.length > SNAPSHOT_COMPACT_AT) {
+					const kept = all.slice(-SNAPSHOT_KEEP);
+					const tmp = `${file}.tmp`;
+					io.writeFile(tmp, kept.map((r) => JSON.stringify(r)).join("\n") + "\n");
+					io.rename(tmp, file);
+				} else {
+					io.appendFile(file, JSON.stringify(row) + "\n");
+				}
+			} catch {
+				// best effort
+			}
+		},
+		load(fingerprint) {
+			return parseAll().filter((r) => r.fingerprint === fingerprint).slice(-SNAPSHOT_KEEP);
+		},
+	};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Alerts (balance/limit thresholds + unconditional insufficient)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface AlertStateV1 {
+	lastBalance?: number;
+	lastRemaining?: number;
+	warnedBalance?: boolean;
+	erroredBalance?: boolean;
+	warnedLimit?: boolean;
+	erroredLimit?: boolean;
+	insufficientReported?: boolean;
+}
+
+export interface AlertEmission {
+	kind: "low-balance" | "low-limit" | "insufficient";
+	messageKey: MsgKey;
+	vars: MsgVars;
+}
+
+const RECOVERY_EPSILON = 1e-6;
+
+export function evaluateAlerts(
+	prev: AlertStateV1 | null,
+	next: { balance?: number; limitRemaining?: number; insufficient: boolean; thresholds: { warn: number; error: number } },
+): { emitted: AlertEmission[]; state: AlertStateV1 } {
+	const state: AlertStateV1 = { ...(prev ?? {}) };
+	const emitted: AlertEmission[] = [];
+
+	if (next.balance !== undefined) {
+		const last = state.lastBalance;
+		if (last !== undefined && next.balance > last + RECOVERY_EPSILON) {
+			state.warnedBalance = false;
+			state.erroredBalance = false;
+		}
+		if (next.balance <= next.thresholds.error) {
+			if (!state.erroredBalance) emitted.push({ kind: "low-balance", messageKey: "alertLowBalance", vars: { balance: formatMoney(next.balance), threshold: formatMoney(next.thresholds.error) } });
+			state.erroredBalance = true;
+			state.warnedBalance = true;
+		} else if (next.balance <= next.thresholds.warn) {
+			if (!state.warnedBalance) emitted.push({ kind: "low-balance", messageKey: "alertLowBalance", vars: { balance: formatMoney(next.balance), threshold: formatMoney(next.thresholds.warn) } });
+			state.warnedBalance = true;
+		}
+		state.lastBalance = next.balance;
+	}
+
+	if (next.limitRemaining !== undefined) {
+		const last = state.lastRemaining;
+		if (last !== undefined && next.limitRemaining > last + RECOVERY_EPSILON) {
+			state.warnedLimit = false;
+			state.erroredLimit = false;
+		}
+		if (next.limitRemaining <= next.thresholds.error) {
+			if (!state.erroredLimit) emitted.push({ kind: "low-limit", messageKey: "alertLowLimit", vars: { remaining: formatMoney(next.limitRemaining), threshold: formatMoney(next.thresholds.error) } });
+			state.erroredLimit = true;
+			state.warnedLimit = true;
+		} else if (next.limitRemaining <= next.thresholds.warn) {
+			if (!state.warnedLimit) emitted.push({ kind: "low-limit", messageKey: "alertLowLimit", vars: { remaining: formatMoney(next.limitRemaining), threshold: formatMoney(next.thresholds.warn) } });
+			state.warnedLimit = true;
+		}
+		state.lastRemaining = next.limitRemaining;
+	}
+
+	if (next.insufficient && state.insufficientReported !== true) {
+		emitted.push({ kind: "insufficient", messageKey: "alertInsufficient", vars: {} });
+		state.insufficientReported = true;
+	} else if (!next.insufficient) {
+		state.insufficientReported = false;
+	}
+
+	return { emitted, state };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Extension factory and default wiring
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type TimerHandle = ReturnType<typeof setTimeout> & { unref?: () => void };
+
+export interface UiLike {
+	setStatus(key: string, text: string | undefined): void;
+	notify(message: string, level: "info" | "warning" | "error"): void;
+	theme: FooterTheme;
+	custom?(
+		factory: (tui: unknown, theme: FooterTheme, kb: KeyLike, done: (value: unknown) => void) => OverlayComponent,
+		options?: { overlay?: boolean; overlayOptions?: { maxHeight?: string | number } },
+	): Promise<unknown>;
+}
+
+export interface ExtensionDeps {
+	env?: Record<string, string | undefined>;
+	nowFn?: () => number;
+	setTimeout?: typeof setTimeout;
+	clearTimeout?: typeof clearTimeout;
+	setInterval?: typeof setInterval;
+	clearInterval?: typeof clearInterval;
+	interactive?: (ctx: CtxLike) => boolean;
+	clientFor(): UsageClientLike;
+	authFor(ctx: CtxLike): Promise<AuthResolution>;
+	store?: BalanceStoreLike;
+	warnThreshold?: () => number;
+	errorThreshold?: () => number;
+}
+
+const REFRESH_DEBOUNCE_MS = 60_000;
+const HEARTBEAT_MS = 5 * 60_000;
+const STALE_HARD_MS = 10 * 60_000;
+const DEFAULT_WARN = 20;
+const DEFAULT_ERROR = 5;
+
+interface ExtensionState {
+	active: boolean;
+	snapshot: Snapshot | null;
+	stale: boolean;
+	fingerprint: string | null;
+	authInvalid: boolean;
+	insufficient: boolean;
+	retryDeadline: number;
+	nextAllowedAt: number;
+	inFlight: boolean;
+	generation: number;
+	lastError: string | null;
+	lastOkFetchAt: number;
+	alertState: AlertStateV1 | null;
+	lastCtx: CtxLike | null;
+}
+
+function isOpenRouterProvider(model: { provider?: string } | null | undefined): boolean {
+	return model?.provider === PROVIDER_ID;
+}
+
+export function createExtension(deps: ExtensionDeps) {
+	const now = () => (deps.nowFn ?? Date.now)();
+	const setTimeoutImpl = deps.setTimeout ?? setTimeout;
+	const clearTimeoutImpl = deps.clearTimeout ?? clearTimeout;
+	const setIntervalImpl = deps.setInterval ?? setInterval;
+	const clearIntervalImpl = deps.clearInterval ?? clearInterval;
+	const isInteractive = (ctx: CtxLike) => deps.interactive?.(ctx) ?? (ctx.mode === "tui" || ctx.hasUI === true);
+	const lang = resolveLang(deps.env ?? {});
+	const store = deps.store ?? { append() { /* */ }, load: () => [] };
+	const warnThreshold = () => {
+		if (deps.warnThreshold) return deps.warnThreshold();
+		const v = Number(deps.env?.["PI_OPENROUTER_BALANCE_WARN"]);
+		return Number.isFinite(v) && v >= 0 ? v : DEFAULT_WARN;
+	};
+	const errorThreshold = () => {
+		if (deps.errorThreshold) return deps.errorThreshold();
+		const v = Number(deps.env?.["PI_OPENROUTER_BALANCE_ERROR"]);
+		return Number.isFinite(v) && v >= 0 ? v : DEFAULT_ERROR;
+	};
+
+	return function install(pi: unknown): void {
+		const s: ExtensionState = {
+			active: false,
+			snapshot: null,
+			stale: false,
+			fingerprint: null,
+			authInvalid: false,
+			insufficient: false,
+			retryDeadline: 0,
+			nextAllowedAt: 0,
+			inFlight: false,
+			generation: 0,
+			lastError: null,
+			lastOkFetchAt: 0,
+			alertState: null,
+			lastCtx: null,
+		};
+
+		const api = pi as {
+			on(event: string, handler: (event: unknown, ctx: CtxLike) => Promise<void> | void): void;
+			registerCommand(name: string, opts: { description: string; getArgumentCompletions?: (prefix: string) => Array<{ value: string; label?: string; description?: string }> | null; handler: (args: string, ctx: CtxLike) => Promise<void> | void }): void;
+		};
+
+		let heartbeatTimer: TimerHandle | null = null;
+		let debounceTimer: TimerHandle | null = null;
+		let retryOneShot: TimerHandle | null = null;
+
+		const clearTimers = () => {
+			if (heartbeatTimer) { clearIntervalImpl(heartbeatTimer as never); heartbeatTimer = null; }
+			if (debounceTimer) { clearTimeoutImpl(debounceTimer as never); debounceTimer = null; }
+			if (retryOneShot) { clearTimeoutImpl(retryOneShot as never); retryOneShot = null; }
+		};
+
+		function footerText(): string {
+			if (!s.active) return "";
+			const label = "openrouter";
+			const theme = (s.lastCtx?.ui as UiLike | undefined)?.theme ?? identityTheme;
+			if (s.authInvalid) return `${label} ${theme.fg("error", msg(lang, "authError"))}`;
+			if (!s.snapshot) {
+				if (now() < s.retryDeadline) return `${label} ${theme.fg("dim", msg(lang, "rateLimited"))}`;
+				if (s.lastError) return `${label} ${theme.fg("error", msg(lang, "error"))}`;
+				return `${label} ${theme.fg("dim", msg(lang, "nA"))}`;
+			}
+			if (s.stale && now() - s.lastOkFetchAt > STALE_HARD_MS) return `${label} ${theme.fg("error", msg(lang, "error"))}`;
+			const out = renderFooter(s.snapshot, {
+				now: now(),
+				stale: s.stale,
+				freeModel: s.lastCtx?.model?.id?.toLowerCase().endsWith(":free") === true,
+				theme,
+				lang,
+			});
+			return s.insufficient ? `${label} ${theme.fg("error", msg(lang, "insufficient"))}` : out;
+		}
+
+		function render(): void {
+			const ui = s.lastCtx?.ui as UiLike | undefined;
+			if (!ui) return;
+			if (!s.active) {
+				ui.setStatus(STATUS_KEY, undefined);
+				return;
+			}
+			ui.setStatus(STATUS_KEY, footerText());
+		}
+
+		const startHeartbeat = () => {
+			if (heartbeatTimer || !s.active) return;
+			heartbeatTimer = setIntervalImpl(() => {
+				if (s.active && s.lastCtx) void refresh(s.lastCtx, false);
+			}, HEARTBEAT_MS) as TimerHandle;
+			heartbeatTimer.unref?.();
+		};
+
+		const scheduleDebouncedRefresh = (ctx: CtxLike) => {
+			if (debounceTimer) return;
+			debounceTimer = setTimeoutImpl(() => {
+				debounceTimer = null;
+				if (s.active && isInteractive(ctx)) void refresh(ctx, false);
+			}, REFRESH_DEBOUNCE_MS) as TimerHandle;
+			debounceTimer.unref?.();
+		};
+
+		const scheduleRetryOneShot = (ctx: CtxLike) => {
+			if (retryOneShot) return;
+			const delay = Math.max(1_000, s.retryDeadline - now());
+			retryOneShot = setTimeoutImpl(() => {
+				retryOneShot = null;
+				if (s.active && isInteractive(ctx)) void refresh(ctx, false);
+			}, delay) as TimerHandle;
+			retryOneShot.unref?.();
+		};
+
+		function emitAlerts(ctx: CtxLike): void {
+			const ui = ctx.ui as UiLike | undefined;
+			if (!ui || !s.snapshot) return;
+			const balance = s.snapshot.account?.balance;
+			const limitRemaining = s.snapshot.key.limitRemaining ?? undefined;
+			const { emitted, state } = evaluateAlerts(s.alertState, {
+				...(balance !== undefined ? { balance } : {}),
+				...(limitRemaining !== undefined ? { limitRemaining } : {}),
+				insufficient: s.insufficient,
+				thresholds: { warn: warnThreshold(), error: errorThreshold() },
+			});
+			s.alertState = state;
+			for (const e of emitted) {
+				ui.notify(msg(lang, e.messageKey, e.vars), e.kind === "low-balance" && e.vars.threshold === formatMoney(errorThreshold()) ? "error" : e.kind === "insufficient" ? "error" : "warning");
+			}
+		}
+
+		async function refresh(ctx: CtxLike, force: boolean): Promise<void> {
+			if (!isInteractive(ctx) || !s.active || s.inFlight) return;
+			if (!force && now() < s.retryDeadline) return;
+			if (!force && now() < s.nextAllowedAt) return;
+			s.inFlight = true;
+			const gen = s.generation;
+			let authRetried = false;
+			try {
+				const auth = await deps.authFor(ctx);
+				if (gen !== s.generation) return;
+				if (auth.status !== "ok") {
+					s.authInvalid = auth.status === "auth-error";
+					s.lastError = auth.status === "no-auth" ? null : "auth";
+					if (s.snapshot) s.stale = true;
+					if (s.authInvalid && !s.snapshot) s.lastError = "auth";
+					render();
+					return;
+				}
+				const result = await deps.clientFor().fetchSnapshot(auth.token, ctxSignal(ctx));
+				if (gen !== s.generation) return;
+				if (result.status === "ok") {
+					s.retryDeadline = 0;
+					s.authInvalid = false;
+					s.lastError = null;
+					s.insufficient = false;
+					const snap = result.snapshot;
+					// fingerprint switch: drop burn history and rebase
+					if (s.fingerprint !== null && s.fingerprint !== snap.fingerprint) {
+						s.alertState = null;
+					}
+					s.fingerprint = snap.fingerprint;
+					s.snapshot = snap;
+					s.stale = false;
+					s.lastOkFetchAt = now();
+					if (snap.account) store.append({ t: now(), fingerprint: snap.fingerprint, balance: snap.account.balance });
+					const series = s.fingerprint ? store.load(s.fingerprint) : [];
+					const rate = estimateBurnRate(series);
+					s.snapshot = rate ? { ...snap, burnRate: rate } : snap;
+					emitAlerts(ctx);
+				} else if (result.status === "retry") {
+					s.retryDeadline = Math.max(s.retryDeadline, now() + result.retryAfterMs);
+					s.nextAllowedAt = Math.max(s.nextAllowedAt, s.retryDeadline);
+					s.lastError = "rate-limit";
+					if (s.snapshot) s.stale = true;
+					scheduleRetryOneShot(ctx);
+				} else {
+					if (result.code === "auth") {
+						if (!authRetried) {
+							authRetried = true;
+							const retryAuth = await deps.authFor(ctx);
+							if (gen !== s.generation) return;
+							if (retryAuth.status === "ok") {
+								const retry = await deps.clientFor().fetchSnapshot(retryAuth.token, ctxSignal(ctx));
+								if (gen !== s.generation) return;
+								if (retry.status === "ok") {
+									s.retryDeadline = 0;
+									s.authInvalid = false;
+									s.lastError = null;
+									s.snapshot = retry.snapshot;
+									s.stale = false;
+									s.lastOkFetchAt = now();
+									s.fingerprint = retry.snapshot.fingerprint;
+									if (retry.snapshot.account) store.append({ t: now(), fingerprint: retry.snapshot.fingerprint, balance: retry.snapshot.account.balance });
+									emitAlerts(ctx);
+									render();
+									return;
+								}
+							}
+						}
+						s.authInvalid = true;
+						s.lastError = "auth";
+						if (s.snapshot) s.stale = true;
+					} else if (result.code === "insufficient") {
+						s.insufficient = true;
+						s.lastError = "insufficient";
+					} else {
+						s.nextAllowedAt = now() + Math.min(1_000 * 2 ** 5, 60_000);
+						s.lastError = result.code;
+						if (s.snapshot) s.stale = true;
+					}
+					emitAlerts(ctx);
+				}
+				render();
+			} catch (error) {
+				if (gen !== s.generation) return;
+				if (isStaleCtxReason(error)) return;
+				if (s.snapshot) s.stale = true;
+				render();
+			} finally {
+				if (gen === s.generation) s.inFlight = false;
+			}
+		}
+
+		function isStaleCtxReason(error: unknown): boolean {
+			return error instanceof Error && (error.message.includes("ctx is stale") || error.message.includes("stale after session"));
+		}
+
+		function ctxSignal(ctx: CtxLike): AbortSignal | undefined {
+			return (ctx as { signal?: AbortSignal }).signal;
+		}
+
+		async function activate(ctx: CtxLike, modelFromEvent?: { provider?: string; id?: string } | null): Promise<void> {
+			s.lastCtx = ctx;
+			const model = modelFromEvent ?? ctx.model ?? null;
+			if (!isOpenRouterProvider(model)) {
+				s.active = false;
+				s.snapshot = null;
+				s.stale = false;
+				clearTimers();
+				render();
+				return;
+			}
+			if (!isInteractive(ctx)) return;
+			s.active = true;
+			render();
+			startHeartbeat();
+			void refresh(ctx, true);
+		}
+
+		api.on("session_start", async (_event, ctx) => {
+			if (!isInteractive(ctx)) return;
+			await activate(ctx);
+		});
+		api.on("model_select", async (event, ctx) => {
+			s.generation += 1;
+			s.inFlight = false;
+			const model = (event as { model?: { provider?: string; id?: string } }).model;
+			s.lastCtx = ctx;
+			if (!isInteractive(ctx)) return;
+			await activate(ctx, model);
+		});
+		api.on("agent_settled", async (_event, ctx) => {
+			if (!isInteractive(ctx) || !s.active) return;
+			scheduleDebouncedRefresh(ctx);
+		});
+		api.on("after_provider_response", async (event, ctx) => {
+			if (!isInteractive(ctx) || !s.active) return;
+			if (ctx.model?.provider !== PROVIDER_ID) return;
+			const status = (event as { status?: number }).status;
+			if (status === 402) {
+				s.insufficient = true;
+				s.lastError = "insufficient";
+				emitAlerts(ctx);
+				render();
+			}
+		});
+		api.on("session_shutdown", async () => {
+			s.generation += 1;
+			s.active = false;
+			clearTimers();
+			render();
+		});
+
+		api.registerCommand("openrouter-balance", {
+			description: "Show OpenRouter account balance and key usage (add --json for raw output)",
+			getArgumentCompletions: (prefix: string) => {
+				const items = [
+					{ value: "--json", label: "--json", description: "Stable JSON snapshot" },
+					{ value: "--refresh", label: "--refresh", description: "Bypass throttling" },
+				];
+				const filtered = items.filter((i) => i.value.startsWith(prefix));
+				return filtered.length > 0 ? filtered : null;
+			},
+			handler: async (args, ctx) => {
+				const ui = ctx.ui as UiLike | undefined;
+				if (!ui) return;
+				try {
+					const parsed = parseCommandArgs(args);
+					if (parsed.error) {
+						ui.notify(msg(lang, "unknownArgs", { arg: parsed.error.arg }), "error");
+						return;
+					}
+					if (parsed.json && ctx.mode !== "tui" && ctx.mode !== "print") {
+						ui.notify(msg(lang, "jsonModeRestricted"), "warning");
+						return;
+					}
+					const auth = await deps.authFor(ctx);
+					if (auth.status !== "ok") {
+						ui.notify(auth.status === "no-auth" ? msg(lang, "authNeeded") : msg(lang, "authFailed"), "error");
+						return;
+					}
+					if (!parsed.refresh && now() < s.retryDeadline) {
+						ui.notify(msg(lang, "rateLimitedNotify"), "error");
+						return;
+					}
+					const result = await deps.clientFor().fetchSnapshot(auth.token, ctxSignal(ctx));
+					if (result.status !== "ok") {
+						ui.notify(result.status === "retry" ? msg(lang, "rateLimitedNotify") : result.message || msg(lang, "fetchFailed"), "error");
+						return;
+					}
+					const snap = result.snapshot;
+					if (snap.account) store.append({ t: now(), fingerprint: snap.fingerprint, balance: snap.account.balance });
+					const series = store.load(snap.fingerprint);
+					const rate = estimateBurnRate(series);
+					const finalSnap = rate ? { ...snap, burnRate: rate } : snap;
+					if (s.active && ctx.model?.provider === PROVIDER_ID) {
+						s.lastCtx = ctx;
+						s.snapshot = finalSnap;
+						s.stale = false;
+						s.fingerprint = finalSnap.fingerprint;
+						s.lastOkFetchAt = now();
+						render();
+					}
+					const runway = finalSnap.account ? runwayHours(finalSnap.account.balance, rate?.perHour ?? 0) : null;
+					if (parsed.json) {
+						const payload = JSON.stringify(toJsonPayload(finalSnap, { stale: s.active ? s.stale : false, runwayHours: runway }), null, 2);
+						if (ctx.mode === "tui") {
+							await showOverlay(ctx, payload.split("\n"), msg(lang, "reportTitle"));
+						} else if (ctx.mode === "print") {
+							console.log(payload);
+						} else {
+							ui.notify(msg(lang, "jsonModeRestricted"), "warning");
+						}
+						return;
+					}
+					const freeModel = ctx.model?.id?.toLowerCase().endsWith(":free") === true;
+					const lines = buildReportLines(finalSnap, { now: now(), lang, stale: s.active ? s.stale : false, freeModel, runwayHours: runway });
+					if (ctx.mode === "tui") {
+						await showOverlay(ctx, lines, msg(lang, "reportTitle"));
+					} else {
+						ui.notify(msg(lang, "reportSummary", { balance: finalSnap.account ? formatMoney(finalSnap.account.balance) : msg(lang, "nA") }), "info");
+					}
+				} catch (error) {
+					if (isStaleCtxReason(error)) return;
+					ui.notify(error instanceof Error ? error.message : msg(lang, "fetchFailed"), "error");
+				}
+			},
+		});
+
+		async function showOverlay(ctx: CtxLike, body: string[], header: string): Promise<void> {
+			const ui = ctx.ui as UiLike | undefined;
+			if (!ui?.custom) return;
+			await ui.custom(
+				(tui, theme, kb, done) => {
+					const rowGen = () => (tui as { terminal?: { rows?: number } }).terminal?.rows ?? 24;
+					return createOverlayComponent({
+						header,
+						body,
+						footer: msg(lang, "pressClose"),
+						theme,
+						kb,
+						done,
+						rowGen,
+						lang,
+					});
+				},
+				{ overlay: true, overlayOptions: { maxHeight: "80%" } },
+			);
+		}
+	};
+}
+
+function parseCommandArgs(args: string): { refresh: boolean; json: boolean; error?: { arg: string } } {
+	const tokens = args.trim().split(/\s+/).filter(Boolean);
+	let refresh = false;
+	let json = false;
+	for (const token of tokens) {
+		if (token === "--refresh") refresh = true;
+		else if (token === "--json") json = true;
+		else return { refresh: true, json: false, error: { arg: token } };
+	}
+	return { refresh, json };
+}
+
+export function openRouterBalanceInstall(pi: unknown): void {
+	const env = process.env as Record<string, string | undefined>;
+	const homedir = nodeOs.homedir();
+	const dir = env["PI_CODING_AGENT_DIR"] ?? nodePath.join(homedir, ".pi", "agent");
+	const store = createBalanceStore(dir, {
+		readFile: (p) => {
+			try { return nodeFs.readFileSync(p, "utf8"); } catch { return null; }
+		},
+		appendFile: (p, text) => {
+			try { nodeFs.appendFileSync(p, text, { mode: 0o600 }); } catch { /* */ }
+		},
+		writeFile: (p, text) => {
+			try { nodeFs.writeFileSync(p, text, { mode: 0o600 }); } catch { /* */ }
+		},
+		rename: (from, to) => {
+			try { nodeFs.renameSync(from, to); } catch { /* */ }
+		},
+		mkdir: (p) => {
+			try { nodeFs.mkdirSync(p, { recursive: true }); } catch { /* */ }
+		},
+	});
+	const client = createUsageClient({ fetchImpl: fetch });
+	createExtension({
+		env,
+		clientFor: () => client,
+		authFor: (ctx) => resolveOpenRouterAuth(ctx),
+		store,
+	})(pi);
 }
