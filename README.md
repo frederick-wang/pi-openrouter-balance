@@ -39,7 +39,7 @@ Appears when the active model's provider is `openrouter`. Cleared on any other p
 | `███████░` | 8-cell remaining bar, shown **only when the key has a credit limit** (remaining/limit); no limit → no bar, nothing is invented |
 | `68%` | remaining percent of the per-key limit |
 | `$6.80/$20` | remaining amount / limit amount for that key |
-| `↓$0.42/h` | burn rate: credits/hour estimated from the balance history (needs ≥3 samples spanning ≥1 h, top-ups start a new window). `PI_OPENROUTER_BALANCE_BURN=key` switches the footer to the per-key rate (`↘` same shape); default is the account rate |
+| `↓$0.42/h` | burn rate: credits/hour estimated from the balance history (needs ≥3 samples spanning ≥1 h, top-ups start a new window). `PI_OPENROUTER_BALANCE_RATE_MODE=key` switches the footer to the per-key rate (`↘` same shape); default is the account rate |
 | `~` | prefix: last refresh failed, previous numbers kept (marked stale, never presented as current) |
 | `·免费` / `·free` | the active model id ends with `:free` (free-model status comes from the model, not the key) |
 | color | bar: green ≥ 50% remaining, yellow 20–49%, red < 20% |
@@ -105,7 +105,7 @@ Fetches on activation and on `/openrouter-balance`; after each settled turn at m
 - `PI_OPENROUTER_BALANCE_LANG=zh|en` — UI language (default: locale, then English).
 - `PI_OPENROUTER_BALANCE_WARN` — low-balance warning threshold in USD (default 20).
 - `PI_OPENROUTER_BALANCE_ERROR` — low-balance error threshold in USD (default 5).
-- `PI_OPENROUTER_BALANCE_BURN=account|key` — which rate the footer shows (default `account`; the report always shows both).
+- `PI_OPENROUTER_BALANCE_RATE_MODE=account|key` — which rate the footer shows (default `account`; the report always shows both).
 - `PI_CODING_AGENT_DIR` — pi config dir (snapshot location) follows pi's own convention.
 
 ## Notes

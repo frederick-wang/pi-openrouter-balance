@@ -99,26 +99,54 @@ test("renderBar: 8 cells, colors by remaining ratio", () => {
 	assert.equal(remainingRatioHealth(0.1), "error");
 });
 
-test("renderFooter: capped + balance → balance, bar, ratio, rate", () => {
+test("renderFooter: capped + balance → balance, bar, ratio, rate (default = this key)", () => {
 	const s = snap({
 		key: key({ limit: 20, limitRemaining: 6.8, limitReset: "monthly" }),
 		account: acct(),
 		burnRate: { perHour: 0.42, windowHours: 5 },
+		keyBurnRate: { perHour: 0.01, windowHours: 5 },
 	});
 	const out = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "en" });
 	assert.match(out, /^openrouter /);
 	assert.match(out, /\$60\.00/);
 	assert.match(out, /34%/); // 6.8/20 remaining
-	assert.match(out, /\$6\.80\/\$20/);
-	assert.match(out, /↓\$0\.42\/h/);
+	assert.match(out, /\$6\.80\/\$20\.00/);
+	assert.match(out, /0\.01\/h/); // default shows THIS KEY rate
+	assert.match(out, /\(this key\)/);
 });
 
-test("renderFooter: uncapped + balance → no bar", () => {
+test("renderFooter: rateMode=account shows the account rate", () => {
+	const s = snap({
+		key: key({ limit: 20, limitRemaining: 6.8 }),
+		account: acct(),
+		burnRate: { perHour: 0.42, windowHours: 5 },
+		keyBurnRate: { perHour: 0.01, windowHours: 5 },
+	});
+	const out = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "zh", rateMode: "account" });
+	assert.match(out, /账户消耗速率 ↓\$0\.42\/h/);
+});
+
+test("renderFooter: rateMode=both and hidden", () => {
+	const s = snap({
+		key: key({}),
+		account: acct(),
+		burnRate: { perHour: 0.42, windowHours: 5 },
+		keyBurnRate: { perHour: 0.01, windowHours: 5 },
+	});
+	const both = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "zh", rateMode: "both" });
+	assert.match(both, /当前密钥消耗速率 ↓\$0\.01\/h/);
+	assert.match(both, /账户消耗速率 ↓\$0\.42\/h/);
+	const hidden = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "en", rateMode: "hidden" });
+	assert.equal(hidden.includes("\/h"), false);
+});
+
+test("renderFooter: uncapped + balance → no bar; account mode shows account rate", () => {
 	const s = snap({ key: key({ limit: null, limitRemaining: null }), account: acct(), burnRate: { perHour: 0.42, windowHours: 5 } });
-	const out = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "en" });
+	const out = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "en", rateMode: "account" });
 	assert.match(out, /^openrouter \$60\.00/);
 	assert.equal(out.includes("█"), false);
-	assert.match(out, /↓\$0\.42\/h/);
+	assert.match(out, /0\.42\/h/);
+	assert.match(out, /\(account\)/);
 });
 
 test("renderFooter: uncapped + balance unavailable → period spend focus", () => {
@@ -233,14 +261,14 @@ test("keyDiscriminator: stable per label, distinct per label, non-secret", () =>
 	assert.notEqual(keyDiscriminator("my-key"), fingerprintOf("user_x"));
 });
 
-test("renderFooter: burnMode=key uses the key burn rate", () => {
+test("renderFooter: rateMode=key uses the key burn rate", () => {
 	const s = snap({
 		key: key({ limit: null }),
 		account: acct(),
 		burnRate: { perHour: 0.42, windowHours: 5 },
 		keyBurnRate: { perHour: 0.01, windowHours: 5 },
 	});
-	const out = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "en", burnMode: "key" });
+	const out = renderFooter(s, { now, theme: { fg: (_r, t) => t }, lang: "en", rateMode: "key" });
 	assert.match(out, /\$60\.00/);
 	assert.match(out, /0\.01\/h/);
 	assert.doesNotMatch(out, /0\.42\/h/);

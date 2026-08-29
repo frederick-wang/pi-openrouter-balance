@@ -38,7 +38,7 @@ pi install git:github.com/frederick-wang/pi-openrouter-balance
 | `███████░` | 8 格剩余进度条，**仅在密钥设了额度上限时出现**（剩余/上限）；没设上限不画条，不发明数据 |
 | `68%` | 额度上限的剩余百分比 |
 | `$6.80/$20` | 该密钥的剩余金额 / 上限金额 |
-| `↓$0.42/h` | 消耗速率：基于余额历史估算的每小时花费（需要 ≥3 个、跨度 1 小时以上的样本；充值跳变会开启新窗口）。`PI_OPENROUTER_BALANCE_BURN=key` 可把 footer 切到密钥速率（形式相同）；默认账户速率 |
+| `↓$0.42/h` | 消耗速率：基于余额历史估算的每小时花费（需要 ≥3 个、跨度 1 小时以上的样本；充值跳变会开启新窗口）。`PI_OPENROUTER_BALANCE_RATE_MODE=key` 可把 footer 切到密钥速率（形式相同）；默认账户速率 |
 | `~` | 前缀：上次刷新失败，保留旧数字（标记陈旧，绝不当最新数据展示） |
 | `·免费` / `·free` | 当前模型 id 以 `:free` 结尾（免费模型状态看模型，不是看密钥） |
 | 颜色 | 进度条：剩余 ≥50% 绿，20–49% 黄，<20% 红 |
@@ -104,7 +104,7 @@ pi install git:github.com/frederick-wang/pi-openrouter-balance
 - `PI_OPENROUTER_BALANCE_LANG=zh|en` — 界面语言（默认：跟随系统语言，再英文）。
 - `PI_OPENROUTER_BALANCE_WARN` — 余额警告阈值（美元，默认 20）。
 - `PI_OPENROUTER_BALANCE_ERROR` — 余额错误阈值（美元，默认 5）。
-- `PI_OPENROUTER_BALANCE_BURN=account|key` — footer 显示哪种速率（默认 `account`；报告始终显示两套）。
+- `PI_OPENROUTER_BALANCE_RATE_MODE=account|key` — footer 显示哪种速率（默认 `account`；报告始终显示两套）。
 - `PI_CODING_AGENT_DIR` — pi 配置目录（快照位置沿用 pi 自身约定）。
 
 ## 说明

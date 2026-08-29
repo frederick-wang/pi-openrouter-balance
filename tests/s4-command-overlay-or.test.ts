@@ -175,3 +175,143 @@ test("overlay: Kitty-safe close and scroll via kb.matches ids", () => {
 	c.handleInput("\x1b[13u"); // kitty enter
 	assert.equal(done, 1);
 });
+
+test("rate-mode command: sets, clears, and status with precedence (command > env > default)", async () => {
+	let prefsText: string | null = null;
+	const prefs = {
+		read: () => prefsText,
+		write: (t: string) => { prefsText = t; },
+	};
+	const { client } = makeClient(async () => ({ status: "ok", snapshot: snap({}) }));
+	const pi = fakePi();
+	createExtension({
+		env: { PI_OPENROUTER_BALANCE_LANG: "en", PI_OPENROUTER_BALANCE_RATE_MODE: "key" },
+		nowFn: () => Date.now(),
+		setTimeout, clearTimeout, setInterval, clearInterval,
+		clientFor: () => client,
+		authFor: async () => ({ status: "ok", token: "sk-or-v1-x" }),
+		prefsRead: prefs.read,
+		prefsWrite: prefs.write,
+	})(pi);
+
+	// status: env wins over the (empty) pref — but note the env itself IS "key"
+	const { ctx: c1, log: l1 } = freshCtx("tui", orModel);
+	await pi.runCommand("openrouter-balance", "rate-mode status", c1);
+	await flush();
+	assert.ok(l1.notifications.some((n) => n.message.includes("this key") && n.message.includes("env")));
+
+	// set via command persists, but env takes precedence — set must SAY so
+	const { ctx: c2, log: l2 } = freshCtx("tui", orModel);
+	await pi.runCommand("openrouter-balance", "rate-mode account", c2);
+	await flush();
+	assert.ok(l2.notifications.some((n) => n.message.includes("account") && n.message.includes("env takes precedence")));
+	assert.equal(prefsText, '{"rateMode":"account"}');
+	// a NEW instance WITH the env var still shows key (env wins over pref)
+	const pi2 = fakePi();
+	createExtension({
+		env: { PI_OPENROUTER_BALANCE_LANG: "en", PI_OPENROUTER_BALANCE_RATE_MODE: "key" },
+		nowFn: () => Date.now(),
+		setTimeout, clearTimeout, setInterval, clearInterval,
+		clientFor: () => client,
+		authFor: async () => ({ status: "ok", token: "sk-or-v1-x" }),
+		prefsRead: prefs.read,
+		prefsWrite: prefs.write,
+	})(pi2);
+	const { ctx: c3, log: l3b } = freshCtx("tui", orModel);
+	await pi2.runCommand("openrouter-balance", "rate-mode status", c3);
+	await flush();
+	assert.ok(l3b.notifications.some((n) => n.message.includes("this key") && n.message.includes("env")));
+	// without the env var, the command pref applies (default -> account here)
+	const pi3 = fakePi();
+	createExtension({
+		env: { PI_OPENROUTER_BALANCE_LANG: "en" },
+		nowFn: () => Date.now(),
+		setTimeout, clearTimeout, setInterval, clearInterval,
+		clientFor: () => client,
+		authFor: async () => ({ status: "ok", token: "sk-or-v1-x" }),
+		prefsRead: prefs.read,
+		prefsWrite: prefs.write,
+	})(pi3);
+	const { ctx: c5, log: l5 } = freshCtx("tui", orModel);
+	await pi3.runCommand("openrouter-balance", "rate-mode status", c5);
+	await flush();
+	assert.ok(l5.notifications.some((n) => n.message.includes("account") && n.message.includes("command")));
+
+	// clear: pref removed; env (in pi's env map) still applies
+	const { ctx: c4, log: l4 } = freshCtx("tui", orModel);
+	await pi.runCommand("openrouter-balance", "rate-mode clear", c4);
+	await flush();
+	assert.ok(l4.notifications.some((n) => n.message.includes("reset to default") && n.message.includes("env still applies")));
+});
+
+test("rate-mode command: refuses in protocol modes; unknown subcommand is an error", async () => {
+	const { client } = makeClient(async () => ({ status: "ok", snapshot: snap({}) }));
+	const { pi } = install(client);
+	const { ctx: rctx, log: rlog } = freshCtx("rpc", orModel);
+	await pi.runCommand("openrouter-balance", "rate-mode key", rctx);
+	await flush();
+	assert.ok(rlog.notifications.some((n) => n.message.includes("requires TUI or print")));
+	const { ctx: ctx2, log: l2 } = freshCtx("tui", orModel);
+	await pi.runCommand("openrouter-balance", "rate-mode banana", ctx2);
+	await flush();
+	assert.ok(l2.notifications.some((n) => n.message.includes("Unknown option")));
+});
+
+test("prefs file hygiene: world-readable prefs are ignored; corrupt JSON falls back to default", async () => {
+	// 模拟：写一个 0644 的 prefs 再读取 → parsePrefs 得到默认（burn 未设）
+	const fs = await import("node:fs");
+	const { join } = await import("node:path");
+	const { tmpdir } = await import("node:os");
+	const dir = fs.mkdtempSync(join(tmpdir(), "orb-prefs-"));
+	const file = join(dir, "pi-openrouter-balance-prefs.json");
+	fs.writeFileSync(file, '{"burn":"key"}', { mode: 0o644 });
+	const raw = (() => {
+		try {
+			const st = fs.lstatSync(file);
+			if (!st.isFile() || st.isSymbolicLink()) return null;
+			if (st.mode & 0o077) return null;
+			return fs.readFileSync(file, "utf8");
+		} catch {
+			return null;
+		}
+	})();
+	assert.equal(raw, null); // 0644 → refused
+	// corrupt JSON → default
+	fs.writeFileSync(file, '{not-json', { mode: 0o600 });
+	const corrupt = fs.readFileSync(file, "utf8");
+	// parsePrefs 容错
+	const { parsePrefs } = await import("../extensions/openrouter-balance.ts");
+	assert.deepEqual(parsePrefs(corrupt), {});
+	assert.deepEqual(parsePrefs(null), {});
+	assert.deepEqual(parsePrefs('{"burn":"key"}'), { rateMode: "key" }); // legacy key tolerated
+	assert.deepEqual(parsePrefs('{"rateMode":"garbage"}'), {});
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("rate-mode command: interactive picker in tui (selection persists, informs of env override)", async () => {
+	let prefsText: string | null = '{"rateMode":"key"}';
+	const reader = { read: () => prefsText, write: (t: string) => { prefsText = t; } };
+	const { client } = makeClient(async () => ({ status: "ok", snapshot: snap({}) }));
+	const pi = fakePi();
+	createExtension({
+		env: { PI_OPENROUTER_BALANCE_LANG: "en", PI_OPENROUTER_BALANCE_RATE_MODE: "key" },
+		nowFn: () => Date.now(),
+		setTimeout, clearTimeout, setInterval, clearInterval,
+		clientFor: () => client,
+		authFor: async () => ({ status: "ok", token: "sk-or-v1-x" }),
+		prefsRead: reader.read,
+		prefsWrite: reader.write,
+	})(pi);
+	// tui + select available → picker used; cancel (undefined) → no change
+	const { ctx, log } = freshCtx("tui", orModel, { selectId: undefined });
+	await pi.runCommand("openrouter-balance", "rate-mode", ctx);
+	await flush();
+	assert.equal(log.selectCalls.length, 1);
+	assert.equal(prefsText, '{"rateMode":"key"}'); // cancelled: unchanged
+	// pick "account" (option index 1)
+	const { ctx: c2, log: l2 } = freshCtx("tui", orModel, { selectId: "1" });
+	await pi.runCommand("openrouter-balance", "rate-mode", c2);
+	await flush();
+	assert.ok(l2.notifications.some((n) => n.message.includes("env takes precedence")));
+	assert.equal(prefsText, '{"rateMode":"account"}');
+});
